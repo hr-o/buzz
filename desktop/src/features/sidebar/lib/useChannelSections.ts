@@ -3,7 +3,9 @@ import * as React from "react";
 import { relayClient } from "@/shared/api/relayClient";
 import {
   boundChannelSectionsStore,
+  clearChannelSectionsOutbox,
   DEFAULT_STORE,
+  readChannelSectionsOutbox,
   readChannelSectionsStore,
   storageKey,
   writeChannelSectionsStore,
@@ -18,6 +20,13 @@ import type {
   ChannelSection,
   ChannelSectionStore,
 } from "./channelSectionsStorage";
+
+// Reconciliation cadence (fix 1). Steady interval re-fetches the head on a
+// healthy socket so divergence self-heals without a reconnect; the retry
+// window backs off from base to max while the fetch keeps failing.
+const RECONCILE_STEADY_MS = 60_000;
+const RECONCILE_RETRY_BASE_MS = 3_000;
+const RECONCILE_RETRY_MAX_MS = 60_000;
 
 export function useChannelSections(
   pubkey: string | undefined,
@@ -104,6 +113,19 @@ export function useChannelSections(
 
   React.useEffect(() => {
     if (!pubkey || !relayUrl) return;
+    const manager = managerRef.current;
+    if (!manager) return;
+    // When a local edit loses whole-blob LWW (pre-publish head is newer) or the
+    // relay rejects it with a conflict, the manager adopts the winning remote
+    // store. Write it through to React state + localStorage so the UI and relay
+    // never diverge; applyRemote also advances the applied-ts guard.
+    manager.setOnRemoteAdopted((remote) => {
+      setStore(applyRemote(remote));
+    });
+  }, [pubkey, relayUrl, applyRemote]);
+
+  React.useEffect(() => {
+    if (!pubkey || !relayUrl) return;
     let cancelled = false;
     const local = readChannelSectionsStore(pubkey, relayUrl);
     void managerRef.current?.bootstrap(local).then((result) => {
@@ -112,10 +134,71 @@ export function useChannelSections(
         setStore(applyRemote(result.data));
       }
       // "hold": seed already performed by bootstrap (if first-sync), or
-      // blocked (failed fetch / prior watermark). Hook does nothing.
+      // blocked (failed fetch / prior watermark). The reconciliation effect
+      // below retries a failed fetch; here we only resume any edit that was
+      // persisted to the durable outbox before a prior quit/community-switch.
+      const outbox = readChannelSectionsOutbox(pubkey, relayUrl);
+      if (outbox) {
+        managerRef.current?.publishSections(outbox);
+      } else {
+        clearChannelSectionsOutbox(pubkey, relayUrl);
+      }
     });
     return () => {
       cancelled = true;
+    };
+  }, [pubkey, relayUrl, applyRemote]);
+
+  // Reconciliation loop (fix 1): a single scheduler that both retries a failed
+  // bootstrap with bounded backoff and periodically re-fetches the head, so
+  // stale-at-open state converges without waiting for a reconnect event a
+  // healthy socket never fires. Also refreshes when the window becomes visible.
+  React.useEffect(() => {
+    if (!pubkey || !relayUrl) return;
+    let cancelled = false;
+    let timer: number | null = null;
+    let delayMs = RECONCILE_RETRY_BASE_MS;
+
+    const schedule = (ms: number) => {
+      if (cancelled) return;
+      if (timer !== null) window.clearTimeout(timer);
+      timer = window.setTimeout(tick, ms);
+    };
+
+    const tick = () => {
+      void managerRef.current?.fetchRemoteSections().then((result) => {
+        if (cancelled) return;
+        if (result.status === "found") {
+          setStore(applyRemote(result.data));
+          // applyRemote cancels the pending debounce; re-queue any live local
+          // edit so a periodic reconcile never silently drops it (mirrors the
+          // reconnect handler). doPublish re-checks the head and adopts if the
+          // remote is genuinely newer.
+          const pending = managerRef.current?.getPendingStore();
+          if (pending) managerRef.current?.publishSections(pending);
+          delayMs = RECONCILE_STEADY_MS; // relay answered → steady cadence
+        } else if (result.status === "absent") {
+          delayMs = RECONCILE_STEADY_MS; // answered (no blob) → steady cadence
+        } else {
+          delayMs = Math.min(delayMs * 2, RECONCILE_RETRY_MAX_MS); // fetch failed → back off
+        }
+        schedule(delayMs);
+      });
+    };
+
+    const onVisible = () => {
+      if (document.visibilityState === "visible") {
+        delayMs = RECONCILE_RETRY_BASE_MS;
+        tick();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    schedule(delayMs);
+
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, [pubkey, relayUrl, applyRemote]);
 

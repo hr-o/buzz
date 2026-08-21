@@ -179,25 +179,28 @@ test("revert-fix: absent fetch with zero watermark seeds via bootstrap (first-sy
   }
 });
 
-// 4. LWW baseline: newer decryptable pre-publish event still wins after an
-//    undecryptable head was recorded.
-// Mutation test: headBeforeFetch → this.lastRemoteCreatedAt makes comparison
-// 200>200=false → local wins instead of remote → wrong content encrypted.
-test("revert-fix: sections LWW — newer decryptable pre-publish event selected after undecryptable head recorded", async () => {
+// 4. Adopt-winner: a newer remote head at pre-publish time supersedes the local
+//    edit — the manager must NOT publish, must hand the remote to the adopt
+//    sink, and must clear the pending/outbox so the loser can't be replayed.
+// Mutation test: reverting adopt→republish makes onRemoteAdopted never fire and
+// publishEvent fire instead.
+test("adopt-winner: newer remote head at pre-publish adopts remote and skips publish", async () => {
   const REMOTE_ID = "remote-section-from-relay";
-  let callCount = 0;
-  mock.method(relayClient, "fetchEvents", () => {
-    callCount++;
-    return Promise.resolve([
+  mock.method(relayClient, "fetchEvents", () =>
+    Promise.resolve([
       {
         pubkey: "pk-lww",
-        content: callCount === 1 ? "bad-cipher" : "good-cipher",
-        created_at: callCount === 1 ? 100 : 200,
-        id: `evt-${callCount}`,
+        content: "good-cipher",
+        created_at: 200,
+        id: "evt-remote",
       },
-    ]);
+    ]),
+  );
+  const publishCalls = [];
+  mock.method(relayClient, "publishEvent", (...args) => {
+    publishCalls.push(args);
+    return Promise.resolve();
   });
-  mock.method(relayClient, "publishEvent", () => Promise.resolve());
   const fw = makeFakeWindow();
   const restore = installFakeWindow(fw);
   const tauri = installTauriMock(
@@ -209,25 +212,178 @@ test("revert-fix: sections LWW — newer decryptable pre-publish event selected 
   );
   try {
     const manager = new ChannelSectionSyncManager("pk-lww", RELAY);
-    await manager.fetchRemoteSections();
-    assert.ok(
-      Number(
-        fw.localStorage.getItem(
-          `buzz-sync-watermark.v1:channel-sections:pk-lww:${RELAY_KEY}`,
-        ) ?? "0",
-      ) >= 100,
+    const adopted = [];
+    manager.setOnRemoteAdopted((r) => adopted.push(r));
+    manager.publishSections(
+      makeSectionsStore([{ id: "local-s", name: "Local", order: 0 }]),
     );
+    // Outbox persisted synchronously on the edit.
+    assert.ok(
+      fw.localStorage.getItem(
+        `buzz-channel-sections-outbox.v1:pk-lww:${RELAY_KEY}`,
+      ) !== null,
+      "edit must be persisted to the durable outbox",
+    );
+    fw._fireTimer();
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(
+      publishCalls.length,
+      0,
+      "must not publish when a newer remote head wins LWW",
+    );
+    assert.equal(adopted.length, 1, "adopt sink must receive the remote");
+    assert.ok(
+      adopted[0].store.sections.some((s) => s.id === REMOTE_ID),
+      "adopted store must be the remote content",
+    );
+    assert.equal(manager.getPendingStore(), null, "pending must be cleared");
+    assert.equal(
+      fw.localStorage.getItem(
+        `buzz-channel-sections-outbox.v1:pk-lww:${RELAY_KEY}`,
+      ),
+      null,
+      "outbox must be cleared on adopt so the loser is never replayed",
+    );
+  } finally {
+    tauri.restore();
+    restore();
+    mock.reset();
+  }
+});
+
+// 4b. Local edit wins (no newer remote head): publishes and clears the outbox.
+test("adopt-winner: local edit at/ahead of head publishes and clears outbox", async () => {
+  mock.method(relayClient, "fetchEvents", () => Promise.resolve([]));
+  const publishCalls = [];
+  mock.method(relayClient, "publishEvent", (...args) => {
+    publishCalls.push(args);
+    return Promise.resolve();
+  });
+  const fw = makeFakeWindow();
+  const restore = installFakeWindow(fw);
+  const tauri = installTauriMock("{}");
+  try {
+    const manager = new ChannelSectionSyncManager("pk-win", RELAY);
+    manager.publishSections(
+      makeSectionsStore([{ id: "s1", name: "Work", order: 0 }]),
+    );
+    fw._fireTimer();
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(publishCalls.length, 1, "local edit must be published");
+    assert.equal(
+      fw.localStorage.getItem(
+        `buzz-channel-sections-outbox.v1:pk-win:${RELAY_KEY}`,
+      ),
+      null,
+      "outbox must be cleared once the edit is published",
+    );
+  } finally {
+    tauri.restore();
+    restore();
+    mock.reset();
+  }
+});
+
+// 4c. Timestamp clamp: a remote head far in the future must not make the
+//     published createdAt walk past the relay's ±15min window.
+// Mutation test: removing the Math.min clamp lets createdAt = lastRemote+1
+// (~now+3600), which exceeds now + MAX_PUBLISH_FUTURE_SECS.
+test("timestamp clamp: published createdAt stays inside the relay future window", async () => {
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const farFutureHead = nowSecs + 3_600; // 1h ahead — beyond the ±15min window
+  let call = 0;
+  mock.method(relayClient, "fetchEvents", () => {
+    call++;
+    // First call: fetchRemoteSections during a manual head prime; subsequent:
+    // pre-publish fetch. Return the far-future undecryptable head each time so
+    // lastRemoteCreatedAt is pushed to farFutureHead but the store still
+    // publishes (local edit is what we're stamping).
+    return Promise.resolve([
+      {
+        pubkey: "pk-clamp",
+        content: "good-cipher",
+        created_at: call === 1 ? farFutureHead : 0,
+        id: "evt-clamp",
+      },
+    ]);
+  });
+  let signedCreatedAt = null;
+  const fw = makeFakeWindow();
+  const restore = installFakeWindow(fw);
+  const tauri = installTauriMock(
+    JSON.stringify({ version: 1, sections: [], assignments: {} }),
+  );
+  mock.method(relayClient, "publishEvent", (evt) => {
+    signedCreatedAt = evt.created_at;
+    return Promise.resolve();
+  });
+  try {
+    const manager = new ChannelSectionSyncManager("pk-clamp", RELAY);
+    // Prime lastRemoteCreatedAt to the far-future head.
+    await manager.fetchRemoteSections();
+    manager.publishSections(
+      makeSectionsStore([{ id: "s1", name: "Work", order: 0 }]),
+    );
+    // Fire debounce; pre-publish fetch returns created_at=0 so local wins.
+    fw._fireTimer();
+    await new Promise((r) => setTimeout(r, 20));
+    assert.ok(signedCreatedAt !== null, "publish must have been attempted");
+    assert.ok(
+      signedCreatedAt <= Math.floor(Date.now() / 1000) + 840,
+      `createdAt must be clamped inside the future window — got ${signedCreatedAt}`,
+    );
+  } finally {
+    tauri.restore();
+    restore();
+    mock.reset();
+  }
+});
+
+// 4d. Conflict rejection: relay OK false → refetch head and adopt it.
+test("conflict rejection: OK-false conflict refetches head and adopts remote", async () => {
+  const REMOTE_ID = "remote-after-conflict";
+  let fetchCall = 0;
+  mock.method(relayClient, "fetchEvents", () => {
+    fetchCall++;
+    // First fetch (pre-publish): empty → local wins and we publish.
+    if (fetchCall === 1) return Promise.resolve([]);
+    // Second fetch (post-conflict refetch): the winning remote head.
+    return Promise.resolve([
+      {
+        pubkey: "pk-conflict",
+        content: "good-cipher",
+        created_at: 500,
+        id: "evt-winner",
+      },
+    ]);
+  });
+  mock.method(relayClient, "publishEvent", () =>
+    Promise.reject(new Error("conflict: newer version exists")),
+  );
+  const fw = makeFakeWindow();
+  const restore = installFakeWindow(fw);
+  const tauri = installTauriMock(
+    JSON.stringify({
+      version: 1,
+      sections: [{ id: REMOTE_ID, name: "Remote", order: 0 }],
+      assignments: {},
+    }),
+  );
+  try {
+    const manager = new ChannelSectionSyncManager("pk-conflict", RELAY);
+    const adopted = [];
+    manager.setOnRemoteAdopted((r) => adopted.push(r));
     manager.publishSections(
       makeSectionsStore([{ id: "local-s", name: "Local", order: 0 }]),
     );
     fw._fireTimer();
     await new Promise((r) => setTimeout(r, 20));
-    const pt = tauri.capturedPlaintext();
-    assert.ok(pt !== null, "nip44EncryptToSelf must have been called");
+    assert.equal(adopted.length, 1, "conflict must trigger adopt of the head");
     assert.ok(
-      JSON.parse(pt).sections?.some((s) => s.id === REMOTE_ID),
-      `remote sections must win LWW merge — got: ${pt}`,
+      adopted[0].store.sections.some((s) => s.id === REMOTE_ID),
+      "adopted store must be the winning remote content",
     );
+    assert.equal(manager.getPendingStore(), null, "pending cleared on adopt");
   } finally {
     tauri.restore();
     restore();
