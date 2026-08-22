@@ -78,6 +78,12 @@ export class ChannelSectionSyncManager {
   private retryDelayMs = RETRY_BASE_MS;
   private lastRemoteCreatedAt: number;
   private pendingStore: ChannelSectionStore | null = null;
+  // Monotonic id for the current pending edit. Every publishSections() bumps
+  // it; every scheduled publish/retry captures the value it was queued for.
+  // A completion (success, adopt, or no-op) may only clear pending state via
+  // compare-and-swap on this generation, so an older in-flight publish can
+  // never erase a newer edit that arrived while it was in flight.
+  private pendingGeneration = 0;
   private lastPublishedStore: ChannelSectionStore | null = null;
   private destroyed = false;
   // Set by the hook so an adopted remote head (local edit lost LWW, or a relay
@@ -151,37 +157,64 @@ export class ChannelSectionSyncManager {
     return this.pendingStore;
   }
 
+  /** True while an unpublished local edit is queued (debouncing or retrying). */
+  hasPendingEdit(): boolean {
+    return this.pendingStore !== null;
+  }
+
   /**
    * Adopt a remote store that superseded a local edit: hand it to the hook for
    * write-through, advance the watermark, and drop the losing pending edit —
    * including the durable outbox, so the outbox can never replay an edit that
    * adopt just decided lost (which would reintroduce divergence).
+   *
+   * Compare-and-swap on `gen`: this adopt was decided against the edit queued at
+   * generation `gen`. If a newer edit arrived while this publish was in flight,
+   * the generation has moved on and that newer edit is the latest writer — it
+   * will publish and win LWW — so a stale adopt must not clear its pending state
+   * or overwrite its optimistic UI. We still advance the watermark (monotonic
+   * and always safe) so the newer edit stamps above this head.
    */
-  private adoptRemote(remote: RemoteSections): void {
+  private adoptRemote(remote: RemoteSections, gen: number): void {
     this.recordRemoteHead(remote.createdAt);
-    this.discardPending();
+    if (gen !== this.pendingGeneration) return;
+    this.pendingStore = null;
+    clearChannelSectionsOutbox(this.pubkey, this.relayUrl);
     this.lastPublishedStore = remote.store;
     if (this.destroyed) return;
     this.onRemoteAdopted?.(remote);
   }
 
-  /** Clear both the in-memory pending edit and its durable outbox copy. */
-  private discardPending(): void {
+  /**
+   * Clear the in-memory pending edit and its durable outbox — but only if the
+   * completing publish still owns the current generation. A publish for an
+   * older edit that finishes after a newer edit was queued must leave the newer
+   * edit (and its retry state) untouched.
+   */
+  private discardPending(gen: number): void {
+    if (gen !== this.pendingGeneration) return;
     this.pendingStore = null;
     clearChannelSectionsOutbox(this.pubkey, this.relayUrl);
   }
 
   publishSections(store: ChannelSectionStore): void {
     this.pendingStore = store;
+    const gen = ++this.pendingGeneration;
     // Persist synchronously so an edit made <2s before quit/community-switch
     // survives teardown and resumes on next mount (fix-3 durable outbox).
     writeChannelSectionsOutbox(this.pubkey, store, this.relayUrl);
     if (this.debounceTimer !== null) {
       window.clearTimeout(this.debounceTimer);
     }
+    // A fresh edit supersedes any retry scheduled for the previous generation.
+    if (this.retryTimer !== null) {
+      window.clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+    this.retryDelayMs = RETRY_BASE_MS;
     this.debounceTimer = window.setTimeout(() => {
       this.debounceTimer = null;
-      void this.doPublish(store);
+      void this.doPublish(store, gen);
     }, DEBOUNCE_MS);
   }
 
@@ -246,19 +279,27 @@ export class ChannelSectionSyncManager {
   }
 
   /** Schedule a bounded-backoff retry of the retained pending edit. */
-  private scheduleRetry(): void {
+  private scheduleRetry(gen: number): void {
     if (this.destroyed || this.pendingStore === null) return;
+    // A newer edit has superseded this one; its own timer owns the retry.
+    if (gen !== this.pendingGeneration) return;
     if (this.retryTimer !== null) return;
     const store = this.pendingStore;
     const delay = this.retryDelayMs;
     this.retryDelayMs = Math.min(this.retryDelayMs * 2, RETRY_MAX_MS);
     this.retryTimer = window.setTimeout(() => {
       this.retryTimer = null;
-      void this.doPublish(store);
+      void this.doPublish(store, gen);
     }, delay);
   }
 
-  private async doPublish(store: ChannelSectionStore): Promise<void> {
+  private async doPublish(
+    store: ChannelSectionStore,
+    gen: number,
+  ): Promise<void> {
+    // A newer edit was queued after this publish was scheduled; it owns the
+    // pending state and will publish the latest store — abandon this stale run.
+    if (gen !== this.pendingGeneration) return;
     try {
       const decision = await this.fetchOwnBlobBeforePublish(store);
       // Guard: manager may have been destroyed while fetchOwnBlobBeforePublish
@@ -266,12 +307,12 @@ export class ChannelSectionSyncManager {
       // before touching the relay.
       if (this.destroyed) return;
       if (decision.kind === "adopt") {
-        this.adoptRemote(decision.remote);
+        this.adoptRemote(decision.remote, gen);
         return;
       }
       const merged = decision.store;
       if (this.isIdenticalToLastPublished(merged)) {
-        this.discardPending();
+        this.discardPending(gen);
         return;
       }
       const payload = {
@@ -308,9 +349,13 @@ export class ChannelSectionSyncManager {
         "Failed to publish channel sections.",
       );
       this.recordRemoteHead(event.created_at);
-      this.lastPublishedStore = merged;
-      this.discardPending();
-      this.retryDelayMs = RETRY_BASE_MS;
+      // Only claim this store as the published head if it is still the current
+      // edit; a newer edit queued mid-flight owns lastPublishedStore now.
+      if (gen === this.pendingGeneration) {
+        this.lastPublishedStore = merged;
+        this.retryDelayMs = RETRY_BASE_MS;
+      }
+      this.discardPending(gen);
     } catch (error) {
       if (this.destroyed) return;
       // The relay rejects a strictly-losing coordinate write with an OK false
@@ -320,9 +365,9 @@ export class ChannelSectionSyncManager {
         const head = await this.fetchRemoteSections();
         if (this.destroyed) return;
         if (head.status === "found") {
-          this.adoptRemote(head.data);
+          this.adoptRemote(head.data, gen);
         } else {
-          this.scheduleRetry();
+          this.scheduleRetry(gen);
         }
         return;
       }
@@ -330,7 +375,7 @@ export class ChannelSectionSyncManager {
       // retry with backoff rather than waiting for a reconnect that a healthy
       // socket never fires.
       console.warn("[channelSectionsSync] publish failed:", error);
-      this.scheduleRetry();
+      this.scheduleRetry(gen);
     }
   }
 

@@ -94,15 +94,26 @@ export function useChannelSections(
     ): ((prev: ChannelSectionStore) => ChannelSectionStore) => {
       return (prev) => {
         if (!pubkey) return prev;
+        // A pending local edit owns convergence: its debounced publish
+        // re-checks the head and either wins (publish) or loses (adopt, which
+        // routes back through onRemoteAdopted with pending already cleared).
+        // Never let a passive remote arrival clobber the optimistic edit or
+        // strand its durable outbox — that is the one-convergence-mechanism
+        // invariant. The adopt path clears pending before calling us, so this
+        // guard is false there and the winning remote still writes through.
+        if (managerRef.current?.hasPendingEdit()) return prev;
         if (remote.createdAt < lastAppliedRemoteTs.current) return prev;
+        // Equal timestamps: the relay/database break ties by `id ASC` — the
+        // LOWEST event id is the canonical winner. Apply a strictly-lower id and
+        // ignore any id >= the last applied, so the UI converges on the same
+        // event the relay stored rather than the largest id seen.
         if (
           remote.createdAt === lastAppliedRemoteTs.current &&
-          remote.eventId <= lastAppliedEventId.current
+          remote.eventId >= lastAppliedEventId.current
         )
           return prev;
         lastAppliedRemoteTs.current = remote.createdAt;
         lastAppliedEventId.current = remote.eventId;
-        managerRef.current?.cancelPendingPublish();
         if (!writeChannelSectionsStore(pubkey, remote.store, relayUrl))
           return prev;
         return remote.store;
@@ -169,13 +180,10 @@ export function useChannelSections(
       void managerRef.current?.fetchRemoteSections().then((result) => {
         if (cancelled) return;
         if (result.status === "found") {
+          // applyRemote defers to a pending local edit (whose own debounced
+          // publish converges via publish-or-adopt), so a periodic reconcile
+          // can never drop it — no re-queue needed.
           setStore(applyRemote(result.data));
-          // applyRemote cancels the pending debounce; re-queue any live local
-          // edit so a periodic reconcile never silently drops it (mirrors the
-          // reconnect handler). doPublish re-checks the head and adopts if the
-          // remote is genuinely newer.
-          const pending = managerRef.current?.getPendingStore();
-          if (pending) managerRef.current?.publishSections(pending);
           delayMs = RECONCILE_STEADY_MS; // relay answered → steady cadence
         } else if (result.status === "absent") {
           delayMs = RECONCILE_STEADY_MS; // answered (no blob) → steady cadence

@@ -436,3 +436,100 @@ test("revert-fix: undecryptable live event advances watermark before decrypt att
     mock.reset();
   }
 });
+
+// 6. Overlapping publishes (fix 1): an older in-flight publish must not clear a
+//    newer edit queued while it was in flight. Regression for the generation
+//    compare-and-swap on discardPending — reverting the gen guard makes the
+//    older completion null out B's pendingStore + outbox.
+test("overlapping publishes: older completion does not erase a newer queued edit", async () => {
+  mock.method(relayClient, "fetchEvents", () => Promise.resolve([]));
+  // First publish blocks until we release it; a second publish is queued while
+  // the first is in flight.
+  let releaseFirst = null;
+  let publishCalls = 0;
+  mock.method(relayClient, "publishEvent", () => {
+    publishCalls++;
+    if (publishCalls === 1) {
+      return new Promise((res) => {
+        releaseFirst = res;
+      });
+    }
+    return Promise.resolve();
+  });
+  // A multi-slot timer fake: each setTimeout is retained by delay so we can fire
+  // the debounce independently and inspect what remains.
+  const storage = new Map();
+  const timers = new Map();
+  let nextId = 1;
+  const fakeWindow = {
+    localStorage: {
+      getItem: (k) => storage.get(k) ?? null,
+      setItem: (k, v) => storage.set(k, v),
+      removeItem: (k) => storage.delete(k),
+    },
+    setTimeout: (fn, ms) => {
+      const id = nextId++;
+      timers.set(id, { fn, ms });
+      return id;
+    },
+    clearTimeout: (id) => timers.delete(id),
+  };
+  const fireDelay = async (ms) => {
+    const entry = [...timers.entries()].find(([, v]) => v.ms === ms);
+    assert.ok(entry, `expected a timer scheduled at ${ms}ms`);
+    timers.delete(entry[0]);
+    entry[1].fn();
+    await Promise.resolve();
+    await Promise.resolve();
+  };
+  const restore = installFakeWindow(fakeWindow);
+  const tauri = installTauriMock("{}");
+  const outboxKey = `buzz-channel-sections-outbox.v1:pk-overlap:${RELAY_KEY}`;
+  try {
+    const manager = new ChannelSectionSyncManager("pk-overlap", RELAY);
+    const storeA = makeSectionsStore([{ id: "a", name: "A", order: 0 }]);
+    const storeB = makeSectionsStore([{ id: "b", name: "B", order: 0 }]);
+
+    manager.publishSections(storeA);
+    await fireDelay(2000); // debounce → doPublish(A) awaits publishEvent
+    while (releaseFirst === null) await Promise.resolve();
+
+    // Edit B arrives while A is still in flight.
+    manager.publishSections(storeB);
+    assert.deepEqual(
+      manager.getPendingStore()?.sections.map((s) => s.id),
+      ["b"],
+      "B is now the pending edit",
+    );
+    assert.equal(
+      JSON.parse(storage.get(outboxKey)).sections[0].id,
+      "b",
+      "outbox holds B",
+    );
+
+    // A completes — its success path must NOT clear B's pending/outbox.
+    releaseFirst();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.deepEqual(
+      manager.getPendingStore()?.sections.map((s) => s.id),
+      ["b"],
+      "older completion must leave B pending",
+    );
+    assert.ok(
+      storage.get(outboxKey) !== undefined,
+      "older completion must leave B's outbox intact",
+    );
+    assert.ok(
+      [...timers.values()].some((t) => t.ms === 2000),
+      "B's debounce timer must survive so it still publishes",
+    );
+    manager.destroy();
+  } finally {
+    tauri.restore();
+    restore();
+    mock.reset();
+  }
+});
