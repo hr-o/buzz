@@ -636,3 +636,197 @@ test("live remote during debounce is adopted at pre-publish, not overwritten", a
     mock.reset();
   }
 });
+
+// 8. Serialized generations (fix round 3, pass-3 finding 1): an older in-flight
+//    publish that completes after a newer edit is queued must NOT be mistaken
+//    for a remote that advanced past the newer edit's baseline. A blocks in
+//    publishEvent; B is queued; A succeeds; B's pre-publish fetch returns A's
+//    accepted head. Because the baseline is frozen at B's own cycle start —
+//    after A's completion recorded its head — B publishes above A instead of
+//    adopting it. Mutation: freezing the baseline at publishSections (before the
+//    prior cycle completes) makes B see A as a post-baseline remote and adopt it.
+test("serialized generations: older completion does not make the newer edit adopt it", async () => {
+  let releaseFirst = null;
+  let publishCalls = 0;
+  let storedHead = [];
+  mock.method(relayClient, "fetchEvents", () => Promise.resolve(storedHead));
+  mock.method(relayClient, "publishEvent", (event) => {
+    publishCalls++;
+    if (publishCalls === 1) {
+      // A's publish blocks; when it resolves, its event becomes the stored head
+      // the next pre-publish fetch will return.
+      return new Promise((res) => {
+        releaseFirst = () => {
+          storedHead = [
+            {
+              id: "event-a",
+              pubkey: "pk-serial",
+              content: "good-cipher",
+              created_at: event.created_at,
+              kind: 30078,
+              tags: [["d", "channel-sections"]],
+              sig: "s",
+            },
+          ];
+          res();
+        };
+      });
+    }
+    return Promise.resolve();
+  });
+  const storage = new Map();
+  const timers = new Map();
+  let nextId = 1;
+  const fakeWindow = {
+    localStorage: {
+      getItem: (k) => storage.get(k) ?? null,
+      setItem: (k, v) => storage.set(k, v),
+      removeItem: (k) => storage.delete(k),
+    },
+    setTimeout: (fn, ms) => {
+      const id = nextId++;
+      timers.set(id, { fn, ms });
+      return id;
+    },
+    clearTimeout: (id) => timers.delete(id),
+  };
+  const fireDelay = async (ms) => {
+    const entry = [...timers.entries()].find(([, v]) => v.ms === ms);
+    assert.ok(entry, `expected a timer scheduled at ${ms}ms`);
+    timers.delete(entry[0]);
+    entry[1].fn();
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+  };
+  const restore = installFakeWindow(fakeWindow);
+  // A's decrypted head must parse; the pre-publish check reads its created_at/id.
+  const tauri = installTauriMock(
+    JSON.stringify({
+      version: 1,
+      sections: [{ id: "a", name: "A", order: 0 }],
+      assignments: {},
+    }),
+  );
+  try {
+    const manager = new ChannelSectionSyncManager("pk-serial", RELAY);
+    const adopted = [];
+    manager.setOnRemoteAdopted((remote) => adopted.push(remote.eventId));
+
+    manager.publishSections(
+      makeSectionsStore([{ id: "a", name: "A", order: 0 }]),
+    );
+    await fireDelay(2000); // A's cycle → publishEvent(A) blocks
+    while (releaseFirst === null) await Promise.resolve();
+
+    // B is queued while A is still in flight; its cycle must defer.
+    manager.publishSections(
+      makeSectionsStore([{ id: "b", name: "B", order: 0 }]),
+    );
+    assert.deepEqual(
+      manager.getPendingStore()?.sections.map((s) => s.id),
+      ["b"],
+      "B is the pending edit while A is in flight",
+    );
+
+    releaseFirst(); // A completes, recording its head; the freed lane drives B
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+    // If B's cycle did not auto-drive on the freed lane, its debounce timer is
+    // still pending — fire it.
+    if ([...timers.values()].some((t) => t.ms === 2000)) await fireDelay(2000);
+
+    assert.deepEqual(adopted, [], "B must not adopt the older generation A");
+    assert.equal(
+      publishCalls,
+      2,
+      "B publishes above A rather than adopting A's accepted head",
+    );
+    assert.equal(
+      manager.getPendingStore(),
+      null,
+      "B's pending clears via its own successful publish, not A's completion",
+    );
+    manager.destroy();
+  } finally {
+    tauri.restore();
+    restore();
+    mock.reset();
+  }
+});
+
+// 9. Serialized generations (fix round 3, pass-3 finding 1): a stale generation
+//    must never sign/publish after a newer edit is queued. A blocks in the
+//    pre-publish fetch; B is queued during that await; A must abort before
+//    signing. Mutation: dropping the post-fetch generation re-check in doPublish
+//    lets the stale A continue to publishEvent.
+test("serialized generations: a stale generation aborts before publishing", async () => {
+  let releaseFetch = null;
+  const publishCalls = [];
+  mock.method(
+    relayClient,
+    "fetchEvents",
+    () =>
+      new Promise((res) => {
+        releaseFetch = () => res([]);
+      }),
+  );
+  mock.method(relayClient, "publishEvent", (...args) => {
+    publishCalls.push(args);
+    return Promise.resolve();
+  });
+  const storage = new Map();
+  const timers = new Map();
+  let nextId = 1;
+  const fakeWindow = {
+    localStorage: {
+      getItem: (k) => storage.get(k) ?? null,
+      setItem: (k, v) => storage.set(k, v),
+      removeItem: (k) => storage.delete(k),
+    },
+    setTimeout: (fn, ms) => {
+      const id = nextId++;
+      timers.set(id, { fn, ms });
+      return id;
+    },
+    clearTimeout: (id) => timers.delete(id),
+  };
+  const fireDelay = async (ms) => {
+    const entry = [...timers.entries()].find(([, v]) => v.ms === ms);
+    assert.ok(entry, `expected a timer scheduled at ${ms}ms`);
+    timers.delete(entry[0]);
+    entry[1].fn();
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+  };
+  const restore = installFakeWindow(fakeWindow);
+  const tauri = installTauriMock("{}");
+  try {
+    const manager = new ChannelSectionSyncManager("pk-stale", RELAY);
+    manager.publishSections(
+      makeSectionsStore([{ id: "a", name: "A", order: 0 }]),
+    );
+    await fireDelay(2000); // A's cycle → doPublish(A) awaits fetchEvents
+    while (releaseFetch === null) await Promise.resolve();
+
+    // B is queued while A is blocked in its pre-publish fetch.
+    manager.publishSections(
+      makeSectionsStore([{ id: "b", name: "B", order: 0 }]),
+    );
+
+    releaseFetch(); // A's fetch resolves; A must see gen moved and abort
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+
+    assert.equal(
+      publishCalls.length,
+      0,
+      "stale generation A must not sign/publish after B was queued",
+    );
+    assert.deepEqual(
+      manager.getPendingStore()?.sections.map((s) => s.id),
+      ["b"],
+      "B remains the pending edit, owning convergence",
+    );
+    manager.destroy();
+  } finally {
+    tauri.restore();
+    restore();
+    mock.reset();
+  }
+});

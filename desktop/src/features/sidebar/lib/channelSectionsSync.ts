@@ -85,6 +85,22 @@ function remoteAdvancedSince(
   );
 }
 
+/**
+ * True when tuple `a` is the canonical winner over `b` (`created_at DESC,
+ * id ASC`). An empty id means "no head seen yet" and always loses.
+ */
+function canonicalGreater(a: PublishBaseline, b: PublishBaseline): boolean {
+  if (a.eventId === "") return false;
+  if (b.eventId === "") return true;
+  if (a.createdAt !== b.createdAt) return a.createdAt > b.createdAt;
+  return a.eventId < b.eventId;
+}
+
+/** The canonical-greater of two head tuples (`created_at DESC, id ASC`). */
+function canonicalMax(a: PublishBaseline, b: PublishBaseline): PublishBaseline {
+  return canonicalGreater(a, b) ? a : b;
+}
+
 async function decryptAndParse(
   event: RelayEvent,
 ): Promise<RemoteSections | null> {
@@ -110,6 +126,14 @@ export class ChannelSectionSyncManager {
   // whether the head advanced *since the edit was queued*, independent of the
   // mutable watermark that a live event during the debounce window may advance.
   private lastRemoteHead: PublishBaseline = { createdAt: 0, eventId: "" };
+  // The canonical head this pending edit is racing against, frozen when the
+  // edit was queued (publishSections) and advanced ONLY by our own successful
+  // publishes. Freezing at queue time is what makes a genuine remote observed
+  // during the debounce window still adopt-worthy (pass-2): the mutable
+  // watermark advanced to that remote, but the baseline did not. Folding our
+  // own published head forward is what stops a newer edit from adopting an
+  // older generation's own accepted write (pass-3): our prior publish is our
+  // baseline, not a competing remote.
   private publishBaseline: PublishBaseline = { createdAt: 0, eventId: "" };
   private pendingStore: ChannelSectionStore | null = null;
   // Monotonic id for the current pending edit. Every publishSections() bumps
@@ -118,6 +142,13 @@ export class ChannelSectionSyncManager {
   // compare-and-swap on this generation, so an older in-flight publish can
   // never erase a newer edit that arrived while it was in flight.
   private pendingGeneration = 0;
+  // Publish cycles are serialized: at most one runs at a time. A newer edit
+  // queued while a cycle is in flight does NOT start its own concurrent cycle;
+  // it defers, and the in-flight cycle's completion schedules it. Serialization
+  // guarantees there is never more than one baseline/fetch/publish sequence
+  // touching shared manager state, so a stale generation can never sign or
+  // publish after a newer edit exists.
+  private publishInFlight = false;
   private lastPublishedStore: ChannelSectionStore | null = null;
   private destroyed = false;
   // Set by the hook so an adopted remote head (local edit lost LWW, or a relay
@@ -244,13 +275,16 @@ export class ChannelSectionSyncManager {
 
   publishSections(store: ChannelSectionStore): void {
     this.pendingStore = store;
-    const gen = ++this.pendingGeneration;
-    // Freeze the canonical head this edit is racing against. The pre-publish
-    // check compares the fetched head against this baseline, not the mutable
-    // watermark — a live event applied during the debounce window advances the
-    // watermark to the new head, which would otherwise make the pre-publish
-    // comparison see equality and fall through to a publish that overwrites a
-    // remote that became head *after* this edit was queued.
+    ++this.pendingGeneration;
+    // Freeze the canonical head this edit is racing against at queue time. The
+    // pre-publish check compares the fetched head against this baseline, not the
+    // mutable watermark — a live event applied during the debounce window
+    // advances the watermark to a new remote head, which would otherwise make
+    // the pre-publish comparison see equality and fall through to a publish that
+    // overwrites a remote that became head *after* this edit was queued. The
+    // baseline only advances via our own successful publishes (see doPublish),
+    // so a prior generation's own accepted write is folded in rather than
+    // mistaken for a competing remote.
     this.publishBaseline = { ...this.lastRemoteHead };
     // Persist synchronously so an edit made <2s before quit/community-switch
     // survives teardown and resumes on next mount (fix-3 durable outbox).
@@ -266,8 +300,38 @@ export class ChannelSectionSyncManager {
     this.retryDelayMs = RETRY_BASE_MS;
     this.debounceTimer = window.setTimeout(() => {
       this.debounceTimer = null;
-      void this.doPublish(store, gen);
+      this.startCycle();
     }, DEBOUNCE_MS);
+  }
+
+  /**
+   * Serialize publish cycles: at most one runs at a time. A debounce/retry
+   * timer that fires while a cycle is in flight defers — the in-flight cycle's
+   * completion re-drives if a pending edit still needs publishing. This kills
+   * the cross-generation race class by construction: a newer edit queued during
+   * a cycle cannot start its own concurrent cycle, so there is never more than
+   * one baseline/fetch/publish sequence competing over shared manager state.
+   */
+  private startCycle(): void {
+    if (this.destroyed || this.pendingStore === null) return;
+    if (this.publishInFlight) return;
+    const store = this.pendingStore;
+    const gen = this.pendingGeneration;
+    this.publishInFlight = true;
+    void this.doPublish(store, gen).finally(() => {
+      this.publishInFlight = false;
+      // A newer edit queued during the cycle (or a cycle that ended without
+      // clearing its pending edit) still needs publishing and has no timer
+      // pending to drive it — drive the next cycle now that the lane is free.
+      if (
+        !this.destroyed &&
+        this.pendingStore !== null &&
+        this.debounceTimer === null &&
+        this.retryTimer === null
+      ) {
+        this.startCycle();
+      }
+    });
   }
 
   private async fetchOwnBlobBeforePublish(
@@ -335,12 +399,11 @@ export class ChannelSectionSyncManager {
     // A newer edit has superseded this one; its own timer owns the retry.
     if (gen !== this.pendingGeneration) return;
     if (this.retryTimer !== null) return;
-    const store = this.pendingStore;
     const delay = this.retryDelayMs;
     this.retryDelayMs = Math.min(this.retryDelayMs * 2, RETRY_MAX_MS);
     this.retryTimer = window.setTimeout(() => {
       this.retryTimer = null;
-      void this.doPublish(store, gen);
+      this.startCycle();
     }, delay);
   }
 
@@ -357,6 +420,11 @@ export class ChannelSectionSyncManager {
       // was awaited (community switch during in-flight fetch). If so, abort
       // before touching the relay.
       if (this.destroyed) return;
+      // A newer edit was queued while we awaited the pre-publish fetch. It owns
+      // convergence now; abort so we neither publish this stale store nor adopt
+      // over the newer pending edit. The serialized cycle re-drives for the
+      // newer generation once this one unwinds.
+      if (gen !== this.pendingGeneration) return;
       if (decision.kind === "adopt") {
         this.adoptRemote(decision.remote, gen);
         return;
@@ -392,14 +460,29 @@ export class ChannelSectionSyncManager {
       });
       // Final guard immediately before the network call — sign/encrypt are
       // synchronous-ish but cheap; the relay socket may have moved to a
-      // different community by the time we reach this point.
-      if (this.destroyed) return;
+      // different community by the time we reach this point, or a newer edit
+      // may have been queued during the encrypt/sign await (invariant: a stale
+      // generation never signs/publishes after a newer edit exists).
+      if (this.destroyed || gen !== this.pendingGeneration) return;
       await relayClient.publishEvent(
         event,
         "Timed out publishing channel sections.",
         "Failed to publish channel sections.",
       );
       this.recordRemoteHead(event.created_at, event.id);
+      // Fold our own accepted head into the pending edit's baseline. This is
+      // unconditional across generations: even a stale generation's own write,
+      // completing after a newer edit was queued, must advance the current
+      // pending baseline so the newer edit's pre-publish check does not mistake
+      // OUR prior publish for a competing remote and adopt it away (pass-3).
+      // Genuine remotes never fold in here — they only advance the watermark —
+      // so a remote that became head during the debounce window still adopts
+      // (pass-2). canonicalMax keeps the advance monotonic (`created_at DESC,
+      // id ASC`).
+      this.publishBaseline = canonicalMax(this.publishBaseline, {
+        createdAt: event.created_at,
+        eventId: event.id,
+      });
       // Only claim this store as the published head if it is still the current
       // edit; a newer edit queued mid-flight owns lastPublishedStore now.
       if (gen === this.pendingGeneration) {

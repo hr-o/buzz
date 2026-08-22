@@ -5,6 +5,7 @@ import {
   boundMuteStore,
   DEFAULT_STORE,
   mergeApplyingRemote,
+  mergeStores,
   mutedChannelIdsFromStore,
   readChannelMutesStore,
   storageKey,
@@ -82,10 +83,27 @@ export function useChannelMutes(
           remote.eventId >= lastAppliedEventId.current
         )
           return prev;
+        // A canonical supersession corrects an already-applied same-timestamp
+        // LARGER-id head with the true winner: only here may the incoming blob's
+        // per-entry values win an equal-`updatedAt` tie, and only here does the
+        // pending publish (which reflected the superseded head) get cancelled.
+        // Any other application (bootstrap / live / newer timestamp) merges over
+        // optimistic local state with local-wins `mergeStores` and must NOT
+        // cancel a pending local publish — otherwise a later same-second local
+        // click (integer-second `updatedAt`) loses to an older remote entry that
+        // decrypts late, and its publish is silently dropped.
+        const isCanonicalSupersession =
+          remote.createdAt === lastAppliedRemoteTs.current &&
+          lastAppliedEventId.current !== "" &&
+          remote.eventId < lastAppliedEventId.current;
         lastAppliedRemoteTs.current = remote.createdAt;
         lastAppliedEventId.current = remote.eventId;
-        managerRef.current?.cancelPendingMutePublish();
-        const merged = mergeApplyingRemote(prev, remote.store);
+        const merged = isCanonicalSupersession
+          ? mergeApplyingRemote(prev, remote.store)
+          : mergeStores(prev, remote.store);
+        if (isCanonicalSupersession) {
+          managerRef.current?.cancelPendingMutePublish();
+        }
         if (!writeChannelMutesStore(pubkey, merged)) return prev;
         return merged;
       };

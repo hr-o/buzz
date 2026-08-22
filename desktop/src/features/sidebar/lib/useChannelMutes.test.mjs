@@ -249,3 +249,107 @@ test("canonical lower-id unmute replaces a stale larger-id mute at equal entry t
     window.__TAURI_INTERNALS__ = origTauri;
   }
 });
+
+// Fix round 3 (pass-3 finding 2): the remote-wins entry-tie merge and the
+// pending-publish cancel apply ONLY to a canonical supersession (a lower id at
+// the same event timestamp correcting an already-applied larger id). A plain
+// live/bootstrap remote must NOT clobber a later same-second local click or
+// cancel its pending publish. Entry `updatedAt` is whole seconds, so a click at
+// 100.9s and an older remote entry at 100.1s both carry `updatedAt:100`; the
+// later local intent must win and keep publishing. Mutation: applying
+// mergeApplyingRemote + cancel unconditionally lets the delayed remote overwrite
+// the click and drop its publish.
+test("delayed same-second remote does not clobber a later local mute or cancel its publish", async () => {
+  const { act, cleanup, renderHook } = await import("@testing-library/react");
+  const { relayClient } = await import("@/shared/api/relayClient");
+  const { useChannelMutes } = await import("./useChannelMutes.ts");
+
+  const origFetch = relayClient.fetchEvents;
+  const origLive = relayClient.subscribeLive;
+  const origReconnect = relayClient.subscribeToReconnects;
+  const origTauri = window.__TAURI_INTERNALS__;
+  const origSetTimeout = window.setTimeout;
+  const origClearTimeout = window.clearTimeout;
+  const origDateNow = Date.now;
+
+  const timers = new Map();
+  let nextTimer = 1;
+  window.setTimeout = (fn, ms) => {
+    const id = nextTimer++;
+    timers.set(id, { fn, ms });
+    return id;
+  };
+  window.clearTimeout = (id) => timers.delete(id);
+  // The local click happens later within second 100.
+  Date.now = () => 100_900;
+
+  let live = null;
+  relayClient.fetchEvents = async () => [];
+  relayClient.subscribeLive = async (_f, cb) => {
+    live = cb;
+    return async () => {};
+  };
+  relayClient.subscribeToReconnects = () => () => {};
+  // The delayed remote entry sits earlier in the same second and says unmuted.
+  window.__TAURI_INTERNALS__ = {
+    invoke: (cmd) => {
+      if (cmd === "nip44_decrypt_from_self")
+        return Promise.resolve(
+          JSON.stringify({
+            version: 1,
+            channels: { shared: { muted: false, updatedAt: 100 } },
+          }),
+        );
+      return Promise.reject(new Error(`unmocked ${cmd}`));
+    },
+  };
+
+  const pubkey = "pk-mute-same-second";
+  const relayUrl = "wss://r.same";
+  let hook = null;
+  try {
+    await act(async () => {
+      hook = renderHook(() => useChannelMutes(pubkey, relayUrl));
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    });
+    assert.ok(live, "live subscription installed");
+
+    // Local optimistic click: muted=true at updatedAt=100 (Date.now=100.9s).
+    await act(async () => {
+      hook.result.current.muteChannel("shared");
+    });
+    // An older remote entry from the same second decrypts and applies late.
+    await act(async () => {
+      live({
+        id: "remote-before-click",
+        pubkey,
+        created_at: 100,
+        content: "remote",
+        kind: 30078,
+        tags: [["d", "channel-mutes"]],
+        sig: "s",
+      });
+      for (let i = 0; i < 40; i++) await Promise.resolve();
+    });
+
+    assert.equal(
+      hook.result.current.mutedChannelIds.has("shared"),
+      true,
+      "a later same-second local click must survive a delayed older remote",
+    );
+    assert.ok(
+      [...timers.values()].some((t) => t.ms === 2000),
+      "the local pending publish must remain scheduled",
+    );
+    hook.unmount();
+  } finally {
+    cleanup();
+    relayClient.fetchEvents = origFetch;
+    relayClient.subscribeLive = origLive;
+    relayClient.subscribeToReconnects = origReconnect;
+    window.__TAURI_INTERNALS__ = origTauri;
+    window.setTimeout = origSetTimeout;
+    window.clearTimeout = origClearTimeout;
+    Date.now = origDateNow;
+  }
+});
