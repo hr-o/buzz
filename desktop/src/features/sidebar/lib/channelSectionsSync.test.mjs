@@ -533,3 +533,106 @@ test("overlapping publishes: older completion does not erase a newer queued edit
     mock.reset();
   }
 });
+
+// 7. Live remote during debounce (pass-2 finding 1): a remote head accepted
+//    while a local edit is debouncing must be adopted at pre-publish, not
+//    overwritten. The live event advances the watermark before doPublish runs,
+//    so comparing the fetched head against the mutable watermark would see
+//    equality and publish over the newer remote. The pre-publish check compares
+//    against the baseline frozen at publishSections instead. Mutation: comparing
+//    against lastRemoteCreatedAt rather than publishBaseline republishes local.
+test("live remote during debounce is adopted at pre-publish, not overwritten", async () => {
+  const remoteEvent = {
+    id: "remote-event",
+    pubkey: "pk-livedebounce",
+    content: "good-cipher",
+    created_at: 1_700_000_100,
+    kind: 30078,
+    tags: [["d", "channel-sections"]],
+    sig: "s",
+  };
+  // Pre-publish fetch returns the same live head that arrived during debounce.
+  mock.method(relayClient, "fetchEvents", () => Promise.resolve([remoteEvent]));
+  const publishCalls = [];
+  mock.method(relayClient, "publishEvent", (...args) => {
+    publishCalls.push(args);
+    return Promise.resolve();
+  });
+  let live = null;
+  mock.method(relayClient, "subscribeLive", async (_filter, cb) => {
+    live = cb;
+    return async () => {};
+  });
+
+  const storage = new Map();
+  const timers = new Map();
+  let nextId = 1;
+  const fakeWindow = {
+    localStorage: {
+      getItem: (k) => storage.get(k) ?? null,
+      setItem: (k, v) => storage.set(k, v),
+      removeItem: (k) => storage.delete(k),
+    },
+    setTimeout: (fn, ms) => {
+      const id = nextId++;
+      timers.set(id, { fn, ms });
+      return id;
+    },
+    clearTimeout: (id) => timers.delete(id),
+  };
+  const fireDelay = async (ms) => {
+    const entry = [...timers.entries()].find(([, v]) => v.ms === ms);
+    assert.ok(entry, `expected a timer scheduled at ${ms}ms`);
+    timers.delete(entry[0]);
+    entry[1].fn();
+    for (let i = 0; i < 50; i++) await Promise.resolve();
+  };
+  const restore = installFakeWindow(fakeWindow);
+  const tauri = installTauriMock(
+    JSON.stringify({
+      version: 1,
+      sections: [{ id: "remote", name: "Remote", order: 0 }],
+      assignments: {},
+    }),
+  );
+  const outboxKey = `buzz-channel-sections-outbox.v1:pk-livedebounce:${RELAY_KEY}`;
+  try {
+    const manager = new ChannelSectionSyncManager("pk-livedebounce", RELAY);
+    const adopted = [];
+    manager.setOnRemoteAdopted((remote) => adopted.push(remote.eventId));
+    await manager.subscribeToSections(() => {});
+    assert.ok(live, "live subscription installed");
+
+    manager.publishSections(
+      makeSectionsStore([{ id: "local", name: "Local", order: 0 }]),
+    );
+    // A genuinely later remote head is accepted and delivered while local is
+    // pending — this advances the watermark past the frozen baseline.
+    live(remoteEvent);
+    for (let i = 0; i < 50; i++) await Promise.resolve();
+
+    await fireDelay(2000);
+
+    assert.equal(
+      publishCalls.length,
+      0,
+      "later remote head must prevent the local publish",
+    );
+    assert.deepEqual(
+      adopted,
+      ["remote-event"],
+      "the remote accepted after the edit began must be adopted",
+    );
+    assert.equal(manager.getPendingStore(), null, "pending cleared on adopt");
+    assert.equal(
+      storage.get(outboxKey),
+      undefined,
+      "outbox cleared on adopt so the loser can't replay",
+    );
+    manager.destroy();
+  } finally {
+    tauri.restore();
+    restore();
+    mock.reset();
+  }
+});

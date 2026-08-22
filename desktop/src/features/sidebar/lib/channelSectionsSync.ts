@@ -57,6 +57,34 @@ type PublishDecision =
   | { kind: "publish"; store: ChannelSectionStore }
   | { kind: "adopt"; remote: RemoteSections };
 
+/**
+ * The canonical remote head as it stood when an edit was queued. The pre-publish
+ * check compares the fetched head against this frozen baseline — never against
+ * the mutable in-memory watermark, which a live event observed during the
+ * debounce window may already have advanced to that same head (silently
+ * suppressing the adopt).
+ */
+type PublishBaseline = { createdAt: number; eventId: string };
+
+/**
+ * True when `head` is the canonical winner over the baseline the edit was queued
+ * against — i.e. the head advanced since the edit began. Canonical order is
+ * `created_at DESC, id ASC`: a strictly-later head wins, and a same-second head
+ * wins only with a strictly-lower id. A same-second head is comparable only once
+ * the baseline id is known (empty id = no prior head seen → not superseded).
+ */
+function remoteAdvancedSince(
+  head: RemoteSections,
+  baseline: PublishBaseline,
+): boolean {
+  if (head.createdAt > baseline.createdAt) return true;
+  return (
+    head.createdAt === baseline.createdAt &&
+    baseline.eventId !== "" &&
+    head.eventId < baseline.eventId
+  );
+}
+
 async function decryptAndParse(
   event: RelayEvent,
 ): Promise<RemoteSections | null> {
@@ -77,6 +105,12 @@ export class ChannelSectionSyncManager {
   private retryTimer: number | null = null;
   private retryDelayMs = RETRY_BASE_MS;
   private lastRemoteCreatedAt: number;
+  // Canonical best head observed so far (`created_at DESC, id ASC`). Frozen into
+  // a per-edit baseline at publishSections so the pre-publish check can tell
+  // whether the head advanced *since the edit was queued*, independent of the
+  // mutable watermark that a live event during the debounce window may advance.
+  private lastRemoteHead: PublishBaseline = { createdAt: 0, eventId: "" };
+  private publishBaseline: PublishBaseline = { createdAt: 0, eventId: "" };
   private pendingStore: ChannelSectionStore | null = null;
   // Monotonic id for the current pending edit. Every publishSections() bumps
   // it; every scheduled publish/retry captures the value it was queued for.
@@ -118,7 +152,7 @@ export class ChannelSectionSyncManager {
       // An event exists — record its created_at regardless of whether we can
       // decrypt it, so seed-publish is blocked even when the payload is
       // unreadable (e.g. wrong key).
-      this.recordRemoteHead(event.created_at);
+      this.recordRemoteHead(event.created_at, event.id);
       const result = await decryptAndParse(event);
       if (!result) {
         return { status: "failed", createdAt: event.created_at };
@@ -134,10 +168,21 @@ export class ChannelSectionSyncManager {
     }
   }
 
-  /** Update in-memory + persisted watermark. */
-  private recordRemoteHead(createdAt: number): void {
+  /** Update in-memory + persisted watermark and the canonical head tuple. */
+  private recordRemoteHead(createdAt: number, eventId: string): void {
     if (createdAt > this.lastRemoteCreatedAt) {
       this.lastRemoteCreatedAt = createdAt;
+    }
+    // Track the canonical-best head (`created_at DESC, id ASC`): a later head
+    // always wins; a same-second head wins only with a strictly-lower id. This
+    // mirrors the relay's stored winner so a frozen baseline reflects reality.
+    if (
+      createdAt > this.lastRemoteHead.createdAt ||
+      (createdAt === this.lastRemoteHead.createdAt &&
+        (this.lastRemoteHead.eventId === "" ||
+          eventId < this.lastRemoteHead.eventId))
+    ) {
+      this.lastRemoteHead = { createdAt, eventId };
     }
     advanceWatermark(this.pubkey, BLOB_TYPE, this.relayUrl, createdAt);
   }
@@ -176,7 +221,7 @@ export class ChannelSectionSyncManager {
    * and always safe) so the newer edit stamps above this head.
    */
   private adoptRemote(remote: RemoteSections, gen: number): void {
-    this.recordRemoteHead(remote.createdAt);
+    this.recordRemoteHead(remote.createdAt, remote.eventId);
     if (gen !== this.pendingGeneration) return;
     this.pendingStore = null;
     clearChannelSectionsOutbox(this.pubkey, this.relayUrl);
@@ -200,6 +245,13 @@ export class ChannelSectionSyncManager {
   publishSections(store: ChannelSectionStore): void {
     this.pendingStore = store;
     const gen = ++this.pendingGeneration;
+    // Freeze the canonical head this edit is racing against. The pre-publish
+    // check compares the fetched head against this baseline, not the mutable
+    // watermark — a live event applied during the debounce window advances the
+    // watermark to the new head, which would otherwise make the pre-publish
+    // comparison see equality and fall through to a publish that overwrites a
+    // remote that became head *after* this edit was queued.
+    this.publishBaseline = { ...this.lastRemoteHead };
     // Persist synchronously so an edit made <2s before quit/community-switch
     // survives teardown and resumes on next mount (fix-3 durable outbox).
     writeChannelSectionsOutbox(this.pubkey, store, this.relayUrl);
@@ -231,18 +283,17 @@ export class ChannelSectionSyncManager {
       if (events.length === 0 || events[0].pubkey !== this.pubkey)
         return { kind: "publish", store };
       const event = events[0];
-      // Snapshot the watermark before advancing it: after recordRemoteHead
-      // runs, lastRemoteCreatedAt equals event.created_at, so the LWW
-      // comparison remote.createdAt > lastRemoteCreatedAt would always be
-      // false and silently suppress the adopt.
-      const headBeforeFetch = this.lastRemoteCreatedAt;
-      this.recordRemoteHead(event.created_at);
       const remote = await decryptAndParse(event);
+      // Record the head after decrypt attempt so the watermark/head-tuple
+      // advance even for an undecryptable payload.
+      this.recordRemoteHead(event.created_at, event.id);
       if (!remote) return { kind: "publish", store };
-      // Sections use whole-blob LWW: a newer remote head wins, and the local
-      // edit is adopted-away rather than silently republished as remote content
-      // while the UI keeps showing the edit.
-      if (remote.createdAt > headBeforeFetch) {
+      // Sections use whole-blob LWW. Compare the fetched head against the
+      // baseline frozen when this edit was queued — NOT the live watermark,
+      // which a passive live event during debounce may already have advanced to
+      // this same head. If the canonical head advanced since the edit began, the
+      // local edit lost and is adopted-away rather than republished over it.
+      if (remoteAdvancedSince(remote, this.publishBaseline)) {
         return { kind: "adopt", remote };
       }
       return { kind: "publish", store };
@@ -348,7 +399,7 @@ export class ChannelSectionSyncManager {
         "Timed out publishing channel sections.",
         "Failed to publish channel sections.",
       );
-      this.recordRemoteHead(event.created_at);
+      this.recordRemoteHead(event.created_at, event.id);
       // Only claim this store as the published head if it is still the current
       // edit; a newer edit queued mid-flight owns lastPublishedStore now.
       if (gen === this.pendingGeneration) {
@@ -393,7 +444,7 @@ export class ChannelSectionSyncManager {
         if (event.pubkey !== this.pubkey) return;
         // Record the raw head before decrypt so an undecryptable live event
         // still advances the watermark and blocks future seed-publish.
-        this.recordRemoteHead(event.created_at);
+        this.recordRemoteHead(event.created_at, event.id);
         void decryptAndParse(event).then((result) => {
           if (result) {
             onUpdate(result);

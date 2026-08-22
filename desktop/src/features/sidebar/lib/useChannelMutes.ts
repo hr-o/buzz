@@ -4,7 +4,7 @@ import { relayClient } from "@/shared/api/relayClient";
 import {
   boundMuteStore,
   DEFAULT_STORE,
-  mergeStores,
+  mergeApplyingRemote,
   mutedChannelIdsFromStore,
   readChannelMutesStore,
   storageKey,
@@ -85,7 +85,7 @@ export function useChannelMutes(
         lastAppliedRemoteTs.current = remote.createdAt;
         lastAppliedEventId.current = remote.eventId;
         managerRef.current?.cancelPendingMutePublish();
-        const merged = mergeStores(prev, remote.store);
+        const merged = mergeApplyingRemote(prev, remote.store);
         if (!writeChannelMutesStore(pubkey, merged)) return prev;
         return merged;
       };

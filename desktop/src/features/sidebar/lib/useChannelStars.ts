@@ -4,7 +4,7 @@ import { relayClient } from "@/shared/api/relayClient";
 import {
   boundStarStore,
   DEFAULT_STORE,
-  mergeStores,
+  mergeApplyingRemote,
   readChannelStarsStore,
   starredChannelIdsFromStore,
   storageKey,
@@ -85,7 +85,7 @@ export function useChannelStars(
         lastAppliedRemoteTs.current = remote.createdAt;
         lastAppliedEventId.current = remote.eventId;
         managerRef.current?.cancelPendingStarPublish();
-        const merged = mergeStores(prev, remote.store);
+        const merged = mergeApplyingRemote(prev, remote.store);
         if (!writeChannelStarsStore(pubkey, merged)) return prev;
         return merged;
       };

@@ -163,3 +163,89 @@ test("equal-timestamp tie-break applies the lower event id (relay canonical winn
     window.__TAURI_INTERNALS__ = origTauri;
   }
 });
+
+// Pass-2 finding 2: the comparator admitting the canonical lower id is
+// necessary but not sufficient. Mutes are a per-entry store, so applyRemote
+// merges the incoming blob into local state. On the SAME channel, a stale
+// larger-id event delivered first (muted=true) must not survive the merge once
+// the canonical lower-id winner (muted=false) arrives at the same entry
+// `updatedAt`. Mutation: reverting the apply path to mergeStores (local/prev
+// wins on tie) keeps the stale muted=true value.
+test("canonical lower-id unmute replaces a stale larger-id mute at equal entry timestamp", async () => {
+  const { act, cleanup, renderHook } = await import("@testing-library/react");
+  const { relayClient } = await import("@/shared/api/relayClient");
+  const { useChannelMutes } = await import("./useChannelMutes.ts");
+
+  const origFetch = relayClient.fetchEvents;
+  const origLive = relayClient.subscribeLive;
+  const origReconnect = relayClient.subscribeToReconnects;
+  const origTauri = window.__TAURI_INTERNALS__;
+
+  let live = null;
+  relayClient.fetchEvents = async () => [];
+  relayClient.subscribeLive = async (_f, cb) => {
+    live = cb;
+    return async () => {};
+  };
+  relayClient.subscribeToReconnects = () => () => {};
+  // Both events target the SAME channel `shared` at the same entry updatedAt.
+  // The larger id `bbbb` says muted; the canonical lower id `aaaa` says not.
+  window.__TAURI_INTERNALS__ = {
+    invoke: (cmd, args) => {
+      if (cmd === "nip44_decrypt_from_self") {
+        const canonicalLowerId = args?.ciphertext === "aaaa";
+        return Promise.resolve(
+          JSON.stringify({
+            version: 1,
+            channels: { shared: { muted: !canonicalLowerId, updatedAt: 100 } },
+          }),
+        );
+      }
+      return Promise.reject(new Error(`unmocked ${cmd}`));
+    },
+  };
+
+  const pubkey = "pk-mute-shared-tie";
+  const relayUrl = "wss://r.tie";
+  let hook = null;
+  try {
+    await act(async () => {
+      hook = renderHook(() => useChannelMutes(pubkey, relayUrl));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    assert.ok(live, "live subscription installed");
+
+    const deliver = async (id) => {
+      await act(async () => {
+        live({
+          id,
+          pubkey,
+          created_at: 1000,
+          content: id,
+          kind: 30078,
+          tags: [["d", "channel-mutes"]],
+          sig: "s",
+        });
+        for (let i = 0; i < 20; i++) await Promise.resolve();
+      });
+    };
+
+    await deliver("bbbb"); // stale larger-id head says muted
+    await deliver("aaaa"); // canonical lower-id winner says unmuted
+
+    assert.equal(
+      hook.result.current.mutedChannelIds.has("shared"),
+      false,
+      "canonical lower-id unmute must replace the stale larger-id mute",
+    );
+    hook.unmount();
+  } finally {
+    cleanup();
+    relayClient.fetchEvents = origFetch;
+    relayClient.subscribeLive = origLive;
+    relayClient.subscribeToReconnects = origReconnect;
+    window.__TAURI_INTERNALS__ = origTauri;
+  }
+});
