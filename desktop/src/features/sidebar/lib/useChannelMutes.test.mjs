@@ -353,3 +353,114 @@ test("delayed same-second remote does not clobber a later local mute or cancel i
     Date.now = origDateNow;
   }
 });
+
+// Fix round 4 (pass-4 finding 2): a canonical correction (lower id at the same
+// event timestamp) knows the incoming event is the relay's winner, but NOT
+// whether the user clicked between the superseded larger-id event and the
+// correction. Sequence: stale `bbbb` applies → user clicks mute later in the
+// same second → canonical `aaaa` decrypts late. `aaaa` and the click share
+// integer `updatedAt`, so the plain remote-wins tie would clobber the click.
+// The dirty-entry overlay keeps the click and the cancel is gone, so its
+// publish stays scheduled. Mutation: dropping the dirty overlay (plain
+// mergeApplyingRemote) lets `aaaa` erase the click; restoring the cancel drops
+// its publish timer.
+test("canonical correction preserves a same-second local click made after the larger-id event", async () => {
+  const { act, cleanup, renderHook } = await import("@testing-library/react");
+  const { relayClient } = await import("@/shared/api/relayClient");
+  const { useChannelMutes } = await import("./useChannelMutes.ts");
+
+  const origFetch = relayClient.fetchEvents;
+  const origLive = relayClient.subscribeLive;
+  const origReconnect = relayClient.subscribeToReconnects;
+  const origTauri = window.__TAURI_INTERNALS__;
+  const origSetTimeout = window.setTimeout;
+  const origClearTimeout = window.clearTimeout;
+  const origDateNow = Date.now;
+
+  const timers = new Map();
+  let nextTimer = 1;
+  window.setTimeout = (fn, ms) => {
+    const id = nextTimer++;
+    timers.set(id, { fn, ms });
+    return id;
+  };
+  window.clearTimeout = (id) => timers.delete(id);
+  // The local click happens later within second 100.
+  Date.now = () => 100_900;
+
+  let live = null;
+  relayClient.fetchEvents = async () => [];
+  relayClient.subscribeLive = async (_f, cb) => {
+    live = cb;
+    return async () => {};
+  };
+  relayClient.subscribeToReconnects = () => () => {};
+  // bbbb (stale larger id) says muted; aaaa (canonical lower id) says not.
+  // Both carry the same entry updatedAt=100, tying the later local click.
+  window.__TAURI_INTERNALS__ = {
+    invoke: (cmd, args) => {
+      if (cmd === "nip44_decrypt_from_self") {
+        const canonicalLowerId = args?.ciphertext === "aaaa";
+        return Promise.resolve(
+          JSON.stringify({
+            version: 1,
+            channels: { shared: { muted: !canonicalLowerId, updatedAt: 100 } },
+          }),
+        );
+      }
+      return Promise.reject(new Error(`unmocked ${cmd}`));
+    },
+  };
+
+  const pubkey = "pk-mute-canonical-dirty";
+  const relayUrl = "wss://r.canon";
+  let hook = null;
+  try {
+    await act(async () => {
+      hook = renderHook(() => useChannelMutes(pubkey, relayUrl));
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    });
+    assert.ok(live, "live subscription installed");
+
+    const deliver = async (id, content) => {
+      await act(async () => {
+        live({
+          id,
+          pubkey,
+          created_at: 100,
+          content,
+          kind: 30078,
+          tags: [["d", "channel-mutes"]],
+          sig: "s",
+        });
+        for (let i = 0; i < 40; i++) await Promise.resolve();
+      });
+    };
+
+    await deliver("bbbb", "bbbb"); // stale larger-id head applies (muted)
+    await act(async () => {
+      hook.result.current.muteChannel("shared"); // user intent after bbbb
+    });
+    await deliver("aaaa", "aaaa"); // canonical correction decrypts late
+
+    assert.equal(
+      hook.result.current.mutedChannelIds.has("shared"),
+      true,
+      "a same-second local click must survive the canonical correction",
+    );
+    assert.ok(
+      [...timers.values()].some((t) => t.ms === 2000),
+      "the local click's pending publish must remain scheduled",
+    );
+    hook.unmount();
+  } finally {
+    cleanup();
+    relayClient.fetchEvents = origFetch;
+    relayClient.subscribeLive = origLive;
+    relayClient.subscribeToReconnects = origReconnect;
+    window.__TAURI_INTERNALS__ = origTauri;
+    window.setTimeout = origSetTimeout;
+    window.clearTimeout = origClearTimeout;
+    Date.now = origDateNow;
+  }
+});

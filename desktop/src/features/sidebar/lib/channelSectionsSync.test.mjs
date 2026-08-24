@@ -339,58 +339,6 @@ test("timestamp clamp: published createdAt stays inside the relay future window"
   }
 });
 
-// 4d. Conflict rejection: relay OK false → refetch head and adopt it.
-test("conflict rejection: OK-false conflict refetches head and adopts remote", async () => {
-  const REMOTE_ID = "remote-after-conflict";
-  let fetchCall = 0;
-  mock.method(relayClient, "fetchEvents", () => {
-    fetchCall++;
-    // First fetch (pre-publish): empty → local wins and we publish.
-    if (fetchCall === 1) return Promise.resolve([]);
-    // Second fetch (post-conflict refetch): the winning remote head.
-    return Promise.resolve([
-      {
-        pubkey: "pk-conflict",
-        content: "good-cipher",
-        created_at: 500,
-        id: "evt-winner",
-      },
-    ]);
-  });
-  mock.method(relayClient, "publishEvent", () =>
-    Promise.reject(new Error("conflict: newer version exists")),
-  );
-  const fw = makeFakeWindow();
-  const restore = installFakeWindow(fw);
-  const tauri = installTauriMock(
-    JSON.stringify({
-      version: 1,
-      sections: [{ id: REMOTE_ID, name: "Remote", order: 0 }],
-      assignments: {},
-    }),
-  );
-  try {
-    const manager = new ChannelSectionSyncManager("pk-conflict", RELAY);
-    const adopted = [];
-    manager.setOnRemoteAdopted((r) => adopted.push(r));
-    manager.publishSections(
-      makeSectionsStore([{ id: "local-s", name: "Local", order: 0 }]),
-    );
-    fw._fireTimer();
-    await new Promise((r) => setTimeout(r, 20));
-    assert.equal(adopted.length, 1, "conflict must trigger adopt of the head");
-    assert.ok(
-      adopted[0].store.sections.some((s) => s.id === REMOTE_ID),
-      "adopted store must be the winning remote content",
-    );
-    assert.equal(manager.getPendingStore(), null, "pending cleared on adopt");
-  } finally {
-    tauri.restore();
-    restore();
-    mock.reset();
-  }
-});
-
 // 5. live-sub: undecryptable event on live path records head before decrypt
 // Mutation test: removing recordRemoteHead before decrypt in the live callback
 // leaves watermark at 0 after a live event.
@@ -822,6 +770,347 @@ test("serialized generations: a stale generation aborts before publishing", asyn
       manager.getPendingStore()?.sections.map((s) => s.id),
       ["b"],
       "B remains the pending edit, owning convergence",
+    );
+    manager.destroy();
+  } finally {
+    tauri.restore();
+    restore();
+    mock.reset();
+  }
+});
+
+// Installs a Tauri mock whose sign_event returns a caller-controlled id per
+// call (so overlapping publishes get distinct event ids) and whose
+// nip44_encrypt_to_self can be made to block, exposing the encrypt/sign await
+// window. `signIds` is consumed in order; the encrypt block is armed on demand.
+function installSeamTauriMock(payload, signIds) {
+  const orig = globalThis.window?.__TAURI_INTERNALS__;
+  if (typeof globalThis.window === "undefined") globalThis.window = {};
+  let signCall = 0;
+  let releaseEncrypt = null;
+  let blockNextEncrypt = false;
+  globalThis.window.__TAURI_INTERNALS__ = {
+    invoke: (cmd, args) => {
+      if (cmd === "nip44_decrypt_from_self") return Promise.resolve(payload);
+      if (cmd === "nip44_encrypt_to_self") {
+        if (!blockNextEncrypt) return Promise.resolve("ct");
+        blockNextEncrypt = false;
+        return new Promise((res) => {
+          releaseEncrypt = () => res("ct");
+        });
+      }
+      if (cmd === "sign_event") {
+        const id = signIds[Math.min(signCall, signIds.length - 1)];
+        signCall++;
+        return Promise.resolve(
+          JSON.stringify({
+            id,
+            pubkey: "pk",
+            content: "ct",
+            created_at: args?.createdAt ?? 0,
+            kind: args?.kind ?? 0,
+            tags: args?.tags ?? [],
+            sig: "s",
+          }),
+        );
+      }
+      return Promise.reject(new Error(`unmocked: ${cmd}`));
+    },
+  };
+  return {
+    restore: () => {
+      if (orig !== undefined) globalThis.window.__TAURI_INTERNALS__ = orig;
+      else delete globalThis.window.__TAURI_INTERNALS__;
+    },
+    armEncryptBlock: () => {
+      blockNextEncrypt = true;
+    },
+    releaseEncrypt: () => releaseEncrypt?.(),
+    hasEncryptBlocked: () => releaseEncrypt !== null,
+  };
+}
+
+// 10. Ambiguous ACK (fix round 4, pass-4 finding 1): the relay accepts A but the
+//     client's ACK is lost (publish promise rejects as a timeout). B was queued
+//     mid-flight. When B's pre-publish fetch returns A's accepted head, it must
+//     recognise A as OUR OWN accepted predecessor — fold it forward and publish
+//     above it — not adopt it and erase B. Mutation: dropping the
+//     ambiguousAttemptIds fold makes B classify A as a foreign advance and adopt.
+test("ambiguous ACK: an accepted-but-unacked A does not make B adopt and disappear", async () => {
+  let releaseFirst = null;
+  let publishCalls = 0;
+  let storedHead = [];
+  mock.method(relayClient, "fetchEvents", () => Promise.resolve(storedHead));
+  mock.method(relayClient, "publishEvent", (event) => {
+    publishCalls++;
+    if (publishCalls === 1) {
+      // A reaches the relay and is stored, but the ACK never arrives: the
+      // promise rejects as a timeout after the frame has left.
+      return new Promise((_res, reject) => {
+        releaseFirst = () => {
+          storedHead = [
+            {
+              id: "event-a",
+              pubkey: "pk-ambiguous",
+              content: "good-cipher",
+              created_at: event.created_at,
+              kind: 30078,
+              tags: [["d", "channel-sections"]],
+              sig: "s",
+            },
+          ];
+          reject(new Error("Timed out publishing channel sections."));
+        };
+      });
+    }
+    return Promise.resolve();
+  });
+  const storage = new Map();
+  const timers = new Map();
+  let nextId = 1;
+  const fakeWindow = {
+    localStorage: {
+      getItem: (k) => storage.get(k) ?? null,
+      setItem: (k, v) => storage.set(k, v),
+      removeItem: (k) => storage.delete(k),
+    },
+    setTimeout: (fn, ms) => {
+      const id = nextId++;
+      timers.set(id, { fn, ms });
+      return id;
+    },
+    clearTimeout: (id) => timers.delete(id),
+  };
+  const fireDelay = async (ms) => {
+    const entry = [...timers.entries()].find(([, v]) => v.ms === ms);
+    assert.ok(entry, `expected a timer scheduled at ${ms}ms`);
+    timers.delete(entry[0]);
+    entry[1].fn();
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+  };
+  const restore = installFakeWindow(fakeWindow);
+  const tauri = installSeamTauriMock(
+    JSON.stringify({
+      version: 1,
+      sections: [{ id: "a", name: "A", order: 0 }],
+      assignments: {},
+    }),
+    ["event-a", "event-b"],
+  );
+  try {
+    const manager = new ChannelSectionSyncManager("pk-ambiguous", RELAY);
+    const adopted = [];
+    manager.setOnRemoteAdopted((r) => adopted.push(r.eventId));
+
+    manager.publishSections(
+      makeSectionsStore([{ id: "a", name: "A", order: 0 }]),
+    );
+    await fireDelay(2000); // A's cycle → publishEvent(A) blocks
+    while (releaseFirst === null) await Promise.resolve();
+
+    manager.publishSections(
+      makeSectionsStore([{ id: "b", name: "B", order: 0 }]),
+    );
+
+    releaseFirst(); // A's ACK is lost; A is stored on the relay regardless
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+    if ([...timers.values()].some((t) => t.ms === 2000)) await fireDelay(2000);
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+
+    assert.deepEqual(
+      adopted,
+      [],
+      "B must not adopt A when A was accepted but its ACK was lost",
+    );
+    assert.equal(
+      publishCalls,
+      2,
+      "B publishes above A's ambiguously-accepted head",
+    );
+    assert.equal(
+      manager.getPendingStore(),
+      null,
+      "B's own successful publish clears its pending edit",
+    );
+    manager.destroy();
+  } finally {
+    tauri.restore();
+    restore();
+    mock.reset();
+  }
+});
+
+// 11. Ambiguous ACK, negative case (fix round 4, pass-4 finding 1): the fold is
+//     gated on an exact id-match against a prior attempt. An advancing head
+//     whose id is NOT one of our attempts is a genuine foreign winner and must
+//     be ADOPTED, never folded. A's ACK is lost (transient) so its id stays in
+//     the ambiguous set, but the head that surfaces is a DIFFERENT foreign id —
+//     proof the relay never accepted A. B must adopt the foreign winner, not
+//     fold it and publish above it. Mutation: dropping the ambiguousAttemptIds
+//     id-guard (folding any advance) makes B erase the foreign winner.
+test("ambiguous ACK: a foreign head is adopted, not folded as our own", async () => {
+  let publishCalls = 0;
+  let fetchCalls = 0;
+  mock.method(relayClient, "fetchEvents", () => {
+    fetchCalls++;
+    // 1: A's pre-publish fetch (empty → A publishes, then its ACK times out).
+    // 2+: B's pre-publish fetch surfaces a FOREIGN winner (id != A's attempt).
+    if (fetchCalls === 1) return Promise.resolve([]);
+    return Promise.resolve([
+      {
+        id: "foreign-winner",
+        pubkey: "pk-reject",
+        content: "good-cipher",
+        created_at: 500,
+        kind: 30078,
+        tags: [["d", "channel-sections"]],
+        sig: "s",
+      },
+    ]);
+  });
+  mock.method(relayClient, "publishEvent", () => {
+    publishCalls++;
+    // A's ACK is lost as a transient timeout; the relay never stored A.
+    if (publishCalls === 1)
+      return Promise.reject(
+        new Error("Timed out publishing channel sections."),
+      );
+    return Promise.resolve();
+  });
+  const storage = new Map();
+  const timers = new Map();
+  let nextId = 1;
+  const fakeWindow = {
+    localStorage: {
+      getItem: (k) => storage.get(k) ?? null,
+      setItem: (k, v) => storage.set(k, v),
+      removeItem: (k) => storage.delete(k),
+    },
+    setTimeout: (fn, ms) => {
+      const id = nextId++;
+      timers.set(id, { fn, ms });
+      return id;
+    },
+    clearTimeout: (id) => timers.delete(id),
+  };
+  const fireDelay = async (ms) => {
+    const entry = [...timers.entries()].find(([, v]) => v.ms === ms);
+    assert.ok(entry, `expected a timer scheduled at ${ms}ms`);
+    timers.delete(entry[0]);
+    entry[1].fn();
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+  };
+  const restore = installFakeWindow(fakeWindow);
+  const tauri = installSeamTauriMock(
+    JSON.stringify({
+      version: 1,
+      sections: [{ id: "a", name: "A", order: 0 }],
+      assignments: {},
+    }),
+    ["event-a", "event-b"],
+  );
+  try {
+    const manager = new ChannelSectionSyncManager("pk-reject", RELAY);
+    const adopted = [];
+    manager.setOnRemoteAdopted((r) => adopted.push(r.eventId));
+
+    manager.publishSections(
+      makeSectionsStore([{ id: "a", name: "A", order: 0 }]),
+    );
+    await fireDelay(2000); // A's cycle → publishEvent rejects (ACK lost)
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+
+    // B is queued; it supersedes A's scheduled retry.
+    manager.publishSections(
+      makeSectionsStore([{ id: "b", name: "B", order: 0 }]),
+    );
+    if ([...timers.values()].some((t) => t.ms === 2000)) await fireDelay(2000);
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+
+    assert.deepEqual(
+      adopted,
+      ["foreign-winner"],
+      "B adopts the foreign head; its id is not one of our attempts",
+    );
+    assert.equal(
+      manager.getPendingStore(),
+      null,
+      "adopt clears the pending edit",
+    );
+    manager.destroy();
+  } finally {
+    tauri.restore();
+    restore();
+    mock.reset();
+  }
+});
+
+// 12. Pre-sign generation guard seam (fix round 4, pass-4 review): the guard
+//     immediately before signing/publishing (post-encrypt) must be individually
+//     load-bearing. B arrives DURING A's encrypt/sign await — past the
+//     post-fetch guard — so only the pre-sign guard can stop A publishing a
+//     stale store. Mutation: dropping the gen re-check at the pre-sign guard
+//     lets stale A reach publishEvent after B was queued.
+test("serialized generations: a newer edit during encrypt/sign aborts the pre-sign publish", async () => {
+  const publishCalls = [];
+  mock.method(relayClient, "fetchEvents", () => Promise.resolve([]));
+  mock.method(relayClient, "publishEvent", (event) => {
+    publishCalls.push(event);
+    return Promise.resolve();
+  });
+  const storage = new Map();
+  const timers = new Map();
+  let nextId = 1;
+  const fakeWindow = {
+    localStorage: {
+      getItem: (k) => storage.get(k) ?? null,
+      setItem: (k, v) => storage.set(k, v),
+      removeItem: (k) => storage.delete(k),
+    },
+    setTimeout: (fn, ms) => {
+      const id = nextId++;
+      timers.set(id, { fn, ms });
+      return id;
+    },
+    clearTimeout: (id) => timers.delete(id),
+  };
+  const fireDelay = async (ms) => {
+    const entry = [...timers.entries()].find(([, v]) => v.ms === ms);
+    assert.ok(entry, `expected a timer scheduled at ${ms}ms`);
+    timers.delete(entry[0]);
+    entry[1].fn();
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+  };
+  const restore = installFakeWindow(fakeWindow);
+  const tauri = installSeamTauriMock("{}", ["event-a", "event-b"]);
+  try {
+    const manager = new ChannelSectionSyncManager("pk-seam", RELAY);
+    tauri.armEncryptBlock(); // A's encrypt will block, exposing the sign window
+    manager.publishSections(
+      makeSectionsStore([{ id: "a", name: "A", order: 0 }]),
+    );
+    await fireDelay(2000); // A's cycle → passes post-fetch guard, blocks in encrypt
+    while (!tauri.hasEncryptBlocked()) await Promise.resolve();
+
+    // B is queued while A is mid encrypt/sign — after A's post-fetch guard.
+    manager.publishSections(
+      makeSectionsStore([{ id: "b", name: "B", order: 0 }]),
+    );
+
+    tauri.releaseEncrypt(); // A resumes; the pre-sign guard must abort it
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+    if ([...timers.values()].some((t) => t.ms === 2000)) await fireDelay(2000);
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+
+    assert.equal(
+      publishCalls.length,
+      1,
+      "only B publishes; stale A aborts at the pre-sign guard",
+    );
+    assert.equal(
+      publishCalls[0].id,
+      "event-b",
+      "the surviving publish is B, not the stale A",
     );
     manager.destroy();
   } finally {

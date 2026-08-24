@@ -4,7 +4,7 @@ import { relayClient } from "@/shared/api/relayClient";
 import {
   boundStarStore,
   DEFAULT_STORE,
-  mergeApplyingRemote,
+  mergeCanonicalSupersession,
   mergeStores,
   readChannelStarsStore,
   starredChannelIdsFromStore,
@@ -34,17 +34,26 @@ export function useChannelStars(
   const managerRef = React.useRef<ChannelStarSyncManager | null>(null);
   const lastAppliedRemoteTs = React.useRef(0);
   const lastAppliedEventId = React.useRef("");
+  // Channels the user changed locally within the current remote second. Their
+  // integer-second `updatedAt` ties the remote's, so a late canonical
+  // correction would clobber them on the remote-wins tie; the overlay in
+  // `mergeCanonicalSupersession` keeps them. Cleared whenever the remote clock
+  // strictly advances — a correction for an earlier second is then stale-
+  // rejected before it can apply, so the prior second's clicks need no cover.
+  const dirtyChannelIds = React.useRef<Set<string>>(new Set());
 
   React.useEffect(() => {
     if (!pubkey || !relayUrl) {
       setStore(DEFAULT_STORE);
       lastAppliedRemoteTs.current = 0;
       lastAppliedEventId.current = "";
+      dirtyChannelIds.current = new Set();
       return;
     }
     setStore(readChannelStarsStore(pubkey));
     lastAppliedRemoteTs.current = 0;
     lastAppliedEventId.current = "";
+    dirtyChannelIds.current = new Set();
     managerRef.current = new ChannelStarSyncManager(pubkey, relayUrl);
     return () => {
       managerRef.current?.destroy();
@@ -85,25 +94,31 @@ export function useChannelStars(
           return prev;
         // A canonical supersession corrects an already-applied same-timestamp
         // LARGER-id head with the true winner: only here may the incoming blob's
-        // per-entry values win an equal-`updatedAt` tie, and only here does the
-        // pending publish (which reflected the superseded head) get cancelled.
-        // Any other application (bootstrap / live / newer timestamp) merges over
-        // optimistic local state with local-wins `mergeStores` and must NOT
-        // cancel a pending local publish — otherwise a later same-second local
-        // click (integer-second `updatedAt`) loses to an older remote entry that
-        // decrypts late, and its publish is silently dropped.
+        // per-entry values win an equal-`updatedAt` tie. Any other application
+        // (bootstrap / live / newer timestamp) merges over optimistic local
+        // state with local-wins `mergeStores`.
         const isCanonicalSupersession =
           remote.createdAt === lastAppliedRemoteTs.current &&
           lastAppliedEventId.current !== "" &&
           remote.eventId < lastAppliedEventId.current;
+        // A strictly-newer remote second retires every locally-dirty entry: a
+        // later correction can only target this new second, so prior clicks
+        // need no cover and the set must not grow unbounded.
+        if (remote.createdAt > lastAppliedRemoteTs.current)
+          dirtyChannelIds.current = new Set();
         lastAppliedRemoteTs.current = remote.createdAt;
         lastAppliedEventId.current = remote.eventId;
+        // A canonical correction must not erase a locally-owned entry the user
+        // changed within this same second (integer-second `updatedAt` ties the
+        // remote's). Overlay the dirty entries back on top of the correction,
+        // and never cancel the pending publish — the click still needs to sync.
         const merged = isCanonicalSupersession
-          ? mergeApplyingRemote(prev, remote.store)
+          ? mergeCanonicalSupersession(
+              prev,
+              remote.store,
+              dirtyChannelIds.current,
+            )
           : mergeStores(prev, remote.store);
-        if (isCanonicalSupersession) {
-          managerRef.current?.cancelPendingStarPublish();
-        }
         if (!writeChannelStarsStore(pubkey, merged)) return prev;
         return merged;
       };
@@ -194,6 +209,10 @@ export function useChannelStars(
           channelId,
         );
         if (!writeChannelStarsStore(pubkey, next)) return prev;
+        // Mark this channel locally-owned for the current remote second so a
+        // late canonical correction with the same integer `updatedAt` can't
+        // clobber the click before its publish syncs.
+        dirtyChannelIds.current.add(channelId);
         managerRef.current?.publishStars(next);
         return next;
       });

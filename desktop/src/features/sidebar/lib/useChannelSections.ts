@@ -126,10 +126,10 @@ export function useChannelSections(
     if (!pubkey || !relayUrl) return;
     const manager = managerRef.current;
     if (!manager) return;
-    // When a local edit loses whole-blob LWW (pre-publish head is newer) or the
-    // relay rejects it with a conflict, the manager adopts the winning remote
-    // store. Write it through to React state + localStorage so the UI and relay
-    // never diverge; applyRemote also advances the applied-ts guard.
+    // When a local edit loses whole-blob LWW (pre-publish head is newer), the
+    // manager adopts the winning remote store. Write it through to React state
+    // + localStorage so the UI and relay never diverge; applyRemote also
+    // advances the applied-ts guard.
     manager.setOnRemoteAdopted((remote) => {
       setStore(applyRemote(remote));
     });

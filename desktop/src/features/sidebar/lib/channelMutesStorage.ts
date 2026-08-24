@@ -156,6 +156,33 @@ function mergeStoresWithTie(
   return boundMuteStore({ version: 1, channels: merged });
 }
 
+/**
+ * Apply a canonical lower-id correction (`mergeApplyingRemote`: remote wins a
+ * per-entry `updatedAt` tie) while preserving entries the user changed locally
+ * since the superseded head was applied. The correction canonicalises remote
+ * history, but a same-second local click carries integer-second `updatedAt`
+ * equal to the remote's, so the plain remote-wins tie would silently clobber
+ * it. For each `dirtyId` the local entry wins only the tie (`l.updatedAt >=
+ * r.updatedAt`) — a genuinely newer remote value still wins, so a stale dirty
+ * id can never override a later correction.
+ */
+export function mergeCanonicalSupersession(
+  local: ChannelMuteStore,
+  remote: ChannelMuteStore,
+  dirtyIds: ReadonlySet<string>,
+): ChannelMuteStore {
+  const applied = mergeApplyingRemote(local, remote);
+  if (dirtyIds.size === 0) return applied;
+  const channels = { ...applied.channels };
+  for (const id of dirtyIds) {
+    const l = local.channels[id];
+    if (!l) continue;
+    const r = remote.channels[id];
+    if (!r || l.updatedAt >= r.updatedAt) channels[id] = l;
+  }
+  return boundMuteStore({ version: 1, channels });
+}
+
 export function mutedChannelIdsFromStore(store: ChannelMuteStore): Set<string> {
   return new Set(
     Object.entries(store.channels)

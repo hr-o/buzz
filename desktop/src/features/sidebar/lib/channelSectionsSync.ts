@@ -149,10 +149,18 @@ export class ChannelSectionSyncManager {
   // touching shared manager state, so a stale generation can never sign or
   // publish after a newer edit exists.
   private publishInFlight = false;
+  // Event ids we signed and sent to the relay but whose ACK never arrived (the
+  // publish promise rejected as a timeout/socket error after the frame left).
+  // The relay MAY have accepted such a write, so if a later cycle's pre-publish
+  // fetch returns a head whose id is in this set, that head is OUR OWN accepted
+  // predecessor — fold it forward and publish above it, rather than adopting it
+  // and erasing the queued edit. An attempt the relay never accepted can never
+  // surface as the head, so an id match is proof of our own accepted write.
+  private ambiguousAttemptIds = new Set<string>();
   private lastPublishedStore: ChannelSectionStore | null = null;
   private destroyed = false;
-  // Set by the hook so an adopted remote head (local edit lost LWW, or a relay
-  // conflict rejection) is written through to React state + localStorage.
+  // Set by the hook so an adopted remote head (local edit lost whole-blob LWW)
+  // is written through to React state + localStorage.
   private onRemoteAdopted: ((remote: RemoteSections) => void) | null = null;
 
   constructor(pubkey: string, relayUrl: string) {
@@ -358,6 +366,18 @@ export class ChannelSectionSyncManager {
       // this same head. If the canonical head advanced since the edit began, the
       // local edit lost and is adopted-away rather than republished over it.
       if (remoteAdvancedSince(remote, this.publishBaseline)) {
+        // Unless the advancing head is a prior publish of OURS whose ACK was
+        // lost: the relay accepted it, but our promise rejected before we could
+        // fold it forward, so it is our own accepted predecessor — not a
+        // competing remote. Fold it into the baseline and publish above it so
+        // the queued edit survives instead of adopting our own stale write away.
+        if (this.ambiguousAttemptIds.has(remote.eventId)) {
+          this.publishBaseline = canonicalMax(this.publishBaseline, {
+            createdAt: remote.createdAt,
+            eventId: remote.eventId,
+          });
+          return { kind: "publish", store };
+        }
         return { kind: "adopt", remote };
       }
       return { kind: "publish", store };
@@ -444,7 +464,8 @@ export class ChannelSectionSyncManager {
       // Clamp inside the relay's future-drift window: never manufacture a
       // timestamp so far ahead that this or a later publish is rejected for
       // drift and wedges. If a skewed remote head sits beyond the window we
-      // will lose LWW and adopt it on conflict rather than walking past it.
+      // will lose LWW and adopt it on the next pre-publish fetch rather than
+      // walking past it.
       const createdAt = Math.min(
         Math.max(now, this.lastRemoteCreatedAt + 1),
         now + MAX_PUBLISH_FUTURE_SECS,
@@ -464,12 +485,21 @@ export class ChannelSectionSyncManager {
       // may have been queued during the encrypt/sign await (invariant: a stale
       // generation never signs/publishes after a newer edit exists).
       if (this.destroyed || gen !== this.pendingGeneration) return;
+      // Record this signed id as an in-flight attempt of unknown fate before we
+      // send it. If the ACK is lost below, a later cycle that fetches this id as
+      // the head recognises it as our own accepted write and folds it forward
+      // rather than adopting it away.
+      this.ambiguousAttemptIds.add(event.id);
       await relayClient.publishEvent(
         event,
         "Timed out publishing channel sections.",
         "Failed to publish channel sections.",
       );
       this.recordRemoteHead(event.created_at, event.id);
+      // This write is now the confirmed accepted head; it dominates every prior
+      // attempt (`created_at DESC, id ASC`), so no earlier ambiguous id can ever
+      // be the canonical head again. Clear the set to keep it bounded.
+      this.ambiguousAttemptIds.clear();
       // Fold our own accepted head into the pending edit's baseline. This is
       // unconditional across generations: even a stale generation's own write,
       // completing after a newer edit was queued, must advance the current
@@ -492,22 +522,14 @@ export class ChannelSectionSyncManager {
       this.discardPending(gen);
     } catch (error) {
       if (this.destroyed) return;
-      // The relay rejects a strictly-losing coordinate write with an OK false
-      // conflict (fix-4). Treat it as a lost race: refetch the head and adopt
-      // it so we converge instead of retrying a write that can never win.
-      if (isConflictRejection(error)) {
-        const head = await this.fetchRemoteSections();
-        if (this.destroyed) return;
-        if (head.status === "found") {
-          this.adoptRemote(head.data, gen);
-        } else {
-          this.scheduleRetry(gen);
-        }
-        return;
-      }
-      // Transient failure (timeout / socket error): keep the pending edit and
-      // retry with backoff rather than waiting for a reconnect that a healthy
-      // socket never fires.
+      // Ambiguous outcome: the publish promise rejected (timeout / socket
+      // error), but the relay may already have accepted the write before the
+      // ACK was lost. Keep the pending edit and retry with backoff rather than
+      // waiting for a reconnect that a healthy socket never fires. The attempt
+      // id stays in ambiguousAttemptIds: if the relay did accept it, a later
+      // cycle that fetches this id as the head folds it forward as our own
+      // accepted predecessor (see fetchOwnBlobBeforePublish) instead of
+      // adopting it away and erasing the queued edit.
       console.warn("[channelSectionsSync] publish failed:", error);
       this.scheduleRetry(gen);
     }
@@ -563,11 +585,4 @@ export class ChannelSectionSyncManager {
     this.cancelPendingPublish();
     this.pendingStore = null;
   }
-}
-
-/** True when a publish error is the relay's stale-coordinate conflict (fix-4). */
-function isConflictRejection(error: unknown): boolean {
-  return (
-    error instanceof Error && error.message.toLowerCase().includes("conflict")
-  );
 }
