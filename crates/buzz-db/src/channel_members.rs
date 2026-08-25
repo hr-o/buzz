@@ -32,6 +32,19 @@ pub struct MemberRecord {
     pub removed_at: Option<DateTime<Utc>>,
 }
 
+/// Namespace for the per-channel membership advisory lock. Serializes the
+/// role-authorization + last-owner-count + write sequences in [`add_member`]
+/// and [`remove_member`] against each other.
+///
+/// Both functions read an owner COUNT and then write a *different* row than the
+/// one they counted, so `READ COMMITTED` snapshot isolation alone permits two
+/// concurrent demotions (or a demotion racing a removal) to each observe two
+/// owners, each pass, and together leave zero — the exact governance loss the
+/// guards exist to prevent. An advisory key rather than `SELECT ... FOR UPDATE`
+/// on the channel row: membership is its own contention domain and must not
+/// serialize against unrelated channel metadata writers (`update_channel`,
+/// `set_topic`, the TTL transition). Distinct key domain from
+/// `buzz_channel_ttl:`.
 const CHANNEL_MEMBERSHIP_LOCK_NAMESPACE: &str = "buzz_channel_membership:";
 
 /// Verify that migration 0032's roster fence is active on the partitioned
