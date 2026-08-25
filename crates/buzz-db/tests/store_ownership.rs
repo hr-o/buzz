@@ -243,3 +243,39 @@ fn api_token_store_has_single_ownership() {
     assert_eq!(count(root, "fn parse_api_token_row("), 0);
     assert_eq!(count(store, "fn parse_api_token_row("), 1);
 }
+
+#[test]
+fn allowlist_store_has_single_ownership() {
+    let root = include_str!("../src/lib.rs");
+    let store = include_str!("../src/allowlist.rs");
+
+    for method in [
+        "is_pubkey_allowed",
+        "has_allowlist_entries",
+        "add_to_allowlist",
+        "remove_from_allowlist",
+        "list_allowlist",
+    ] {
+        let signature = format!("pub async fn {method}(");
+        assert_eq!(count(root, &signature), 0, "{method} remains in lib.rs");
+        assert_eq!(count(store, &signature), 1, "{method} is not singly owned");
+        assert_eq!(
+            count(store, &format!("name = \"{method}\"")),
+            1,
+            "{method} span is not unique"
+        );
+    }
+
+    assert_eq!(count(root, "struct AllowlistEntry"), 0);
+    assert_eq!(count(store, "struct AllowlistEntry"), 1);
+    assert_eq!(count(root, "async fn allowlist_is_scoped_to_community("), 0);
+    assert_eq!(
+        count(store, "async fn allowlist_is_scoped_to_community("),
+        1
+    );
+    assert_eq!(
+        count(store, "backfill_from_allowlist"),
+        0,
+        "NIP-43 backfill must remain relay-membership owned"
+    );
+}
