@@ -1268,7 +1268,7 @@ pub async fn find_by_owner_and_name(
     }
 }
 
-// -- Tests --------------------------------------------------------------------
+// -- Db API -------------------------------------------------------------------
 
 impl Db {
     /// Create a new workflow.
@@ -1512,6 +1512,8 @@ impl Db {
         crate::workflow::find_by_owner_and_name(&self.pool, community_id, owner_pubkey, name).await
     }
 }
+
+// -- Tests --------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
