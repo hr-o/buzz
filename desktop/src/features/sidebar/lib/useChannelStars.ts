@@ -3,9 +3,10 @@ import * as React from "react";
 import { relayClient } from "@/shared/api/relayClient";
 import {
   boundStarStore,
+  clearChannelStarsOutbox,
   DEFAULT_STORE,
-  mergeCanonicalSupersession,
   mergeStores,
+  readChannelStarsOutbox,
   readChannelStarsStore,
   starredChannelIdsFromStore,
   storageKey,
@@ -15,6 +16,13 @@ import {
 } from "./channelStarsStorage";
 import { ChannelStarSyncManager } from "./channelStarsSync";
 import type { RemoteStars } from "./channelStarsSync";
+
+// Reconciliation cadence. Steady interval re-fetches the head on a healthy
+// socket so a silently-lost publish converges without waiting for a reconnect
+// that may never fire; the retry window backs off while the fetch keeps failing.
+const RECONCILE_STEADY_MS = 60_000;
+const RECONCILE_RETRY_BASE_MS = 3_000;
+const RECONCILE_RETRY_MAX_MS = 60_000;
 
 export function useChannelStars(
   pubkey: string | undefined,
@@ -32,28 +40,13 @@ export function useChannelStars(
   });
 
   const managerRef = React.useRef<ChannelStarSyncManager | null>(null);
-  const lastAppliedRemoteTs = React.useRef(0);
-  const lastAppliedEventId = React.useRef("");
-  // Channels the user changed locally within the current remote second. Their
-  // integer-second `updatedAt` ties the remote's, so a late canonical
-  // correction would clobber them on the remote-wins tie; the overlay in
-  // `mergeCanonicalSupersession` keeps them. Cleared whenever the remote clock
-  // strictly advances — a correction for an earlier second is then stale-
-  // rejected before it can apply, so the prior second's clicks need no cover.
-  const dirtyChannelIds = React.useRef<Set<string>>(new Set());
 
   React.useEffect(() => {
     if (!pubkey || !relayUrl) {
       setStore(DEFAULT_STORE);
-      lastAppliedRemoteTs.current = 0;
-      lastAppliedEventId.current = "";
-      dirtyChannelIds.current = new Set();
       return;
     }
     setStore(readChannelStarsStore(pubkey));
-    lastAppliedRemoteTs.current = 0;
-    lastAppliedEventId.current = "";
-    dirtyChannelIds.current = new Set();
     managerRef.current = new ChannelStarSyncManager(pubkey, relayUrl);
     return () => {
       managerRef.current?.destroy();
@@ -61,6 +54,9 @@ export function useChannelStars(
     };
   }, [pubkey, relayUrl]);
 
+  // Cross-window sync: another window/tab wrote the shared store. Ingest it into
+  // the high-water and max-merge it into this window's state, so a click that
+  // follows sees the peer's revs/timestamps and no window's edit is clobbered.
   React.useEffect(() => {
     if (!pubkey) {
       return;
@@ -70,7 +66,9 @@ export function useChannelStars(
       if (e.key !== key) {
         return;
       }
-      setStore(readChannelStarsStore(pubkey));
+      const incoming = readChannelStarsStore(pubkey);
+      managerRef.current?.observe(incoming);
+      setStore((prev) => mergeStores(prev, incoming));
     };
     window.addEventListener("storage", handler);
     return () => {
@@ -78,47 +76,15 @@ export function useChannelStars(
     };
   }, [pubkey]);
 
+  // Every remote payload is observed by the manager before it reaches here
+  // (fetch/subscribe paths call observe() internally; the storage handler
+  // observes above), so this is a pure max-merge with no ordering or ownership
+  // overlay — "later" lives in the (updatedAt, rev) tuple.
   const applyRemote = React.useCallback(
     (remote: RemoteStars): ((prev: ChannelStarStore) => ChannelStarStore) => {
       return (prev) => {
         if (!pubkey) return prev;
-        if (remote.createdAt < lastAppliedRemoteTs.current) return prev;
-        // Equal timestamps: the relay/database break ties by `id ASC` — the
-        // LOWEST event id is the canonical winner. Apply a strictly-lower id and
-        // ignore any id >= the last applied, so the UI converges on the same
-        // event the relay stored rather than the largest id seen.
-        if (
-          remote.createdAt === lastAppliedRemoteTs.current &&
-          remote.eventId >= lastAppliedEventId.current
-        )
-          return prev;
-        // A canonical supersession corrects an already-applied same-timestamp
-        // LARGER-id head with the true winner: only here may the incoming blob's
-        // per-entry values win an equal-`updatedAt` tie. Any other application
-        // (bootstrap / live / newer timestamp) merges over optimistic local
-        // state with local-wins `mergeStores`.
-        const isCanonicalSupersession =
-          remote.createdAt === lastAppliedRemoteTs.current &&
-          lastAppliedEventId.current !== "" &&
-          remote.eventId < lastAppliedEventId.current;
-        // A strictly-newer remote second retires every locally-dirty entry: a
-        // later correction can only target this new second, so prior clicks
-        // need no cover and the set must not grow unbounded.
-        if (remote.createdAt > lastAppliedRemoteTs.current)
-          dirtyChannelIds.current = new Set();
-        lastAppliedRemoteTs.current = remote.createdAt;
-        lastAppliedEventId.current = remote.eventId;
-        // A canonical correction must not erase a locally-owned entry the user
-        // changed within this same second (integer-second `updatedAt` ties the
-        // remote's). Overlay the dirty entries back on top of the correction,
-        // and never cancel the pending publish — the click still needs to sync.
-        const merged = isCanonicalSupersession
-          ? mergeCanonicalSupersession(
-              prev,
-              remote.store,
-              dirtyChannelIds.current,
-            )
-          : mergeStores(prev, remote.store);
+        const merged = mergeStores(prev, remote.store);
         if (!writeChannelStarsStore(pubkey, merged)) return prev;
         return merged;
       };
@@ -136,9 +102,66 @@ export function useChannelStars(
         setStore(applyRemote(result.data));
       }
       // "hold": seed already performed by bootstrap (if first-sync), or blocked.
+      // Resume any edit persisted to the durable outbox before a prior
+      // quit/community-switch so a click made <2s before teardown still syncs.
+      const outbox = readChannelStarsOutbox(pubkey, relayUrl);
+      if (outbox) {
+        managerRef.current?.publishStars(outbox);
+      } else {
+        clearChannelStarsOutbox(pubkey, relayUrl);
+      }
     });
     return () => {
       cancelled = true;
+    };
+  }, [pubkey, relayUrl, applyRemote]);
+
+  // Reconciliation loop: a single scheduler that both retries a failed bootstrap
+  // fetch with bounded backoff and periodically re-fetches the head, so a
+  // silently-lost publish converges within the steady cadence without waiting
+  // for a reconnect a healthy socket never fires. Also refreshes on visibility.
+  React.useEffect(() => {
+    if (!pubkey || !relayUrl) return;
+    let cancelled = false;
+    let timer: number | null = null;
+    let delayMs = RECONCILE_RETRY_BASE_MS;
+
+    const schedule = (ms: number) => {
+      if (cancelled) return;
+      if (timer !== null) window.clearTimeout(timer);
+      timer = window.setTimeout(tick, ms);
+    };
+
+    const tick = () => {
+      void managerRef.current?.fetchRemoteStars().then((result) => {
+        if (cancelled) return;
+        if (result.status === "found") {
+          // max-merge folds the head into state without dropping a pending
+          // edit (that edit is in prev and owned by the manager's retry lane).
+          setStore(applyRemote(result.data));
+          delayMs = RECONCILE_STEADY_MS; // relay answered → steady cadence
+        } else if (result.status === "absent") {
+          delayMs = RECONCILE_STEADY_MS; // answered (no blob) → steady cadence
+        } else {
+          delayMs = Math.min(delayMs * 2, RECONCILE_RETRY_MAX_MS); // failed → back off
+        }
+        schedule(delayMs);
+      });
+    };
+
+    const onVisible = () => {
+      if (document.visibilityState === "visible") {
+        delayMs = RECONCILE_RETRY_BASE_MS;
+        tick();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    schedule(delayMs);
+
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, [pubkey, relayUrl, applyRemote]);
 
@@ -196,11 +219,23 @@ export function useChannelStars(
   const setStarState = React.useCallback(
     (channelId: string, starred: boolean) => {
       if (!pubkey) return;
-      const entry: ChannelStarEntry = {
-        starred,
-        updatedAt: Math.floor(Date.now() / 1000),
-      };
+      const now = Math.floor(Date.now() / 1000);
       setStore((prev) => {
+        const manager = managerRef.current;
+        const localEntry = prev.channels[channelId];
+        // Logical-monotonic mint: never regress below any (updatedAt, rev) this
+        // replica has observed for the channel (local entry OR manager
+        // high-water), so the click strictly dominates observed state in both
+        // merge keys — it can never lose to state it has already seen.
+        const updatedAt = Math.max(
+          now,
+          localEntry?.updatedAt ?? 0,
+          manager?.maxUpdatedAtSeen(channelId) ?? 0,
+        );
+        const rev =
+          Math.max(localEntry?.rev ?? 0, manager?.maxRevSeen(channelId) ?? 0) +
+          1;
+        const entry: ChannelStarEntry = { starred, updatedAt, rev };
         const next = boundStarStore(
           {
             version: 1,
@@ -209,11 +244,7 @@ export function useChannelStars(
           channelId,
         );
         if (!writeChannelStarsStore(pubkey, next)) return prev;
-        // Mark this channel locally-owned for the current remote second so a
-        // late canonical correction with the same integer `updatedAt` can't
-        // clobber the click before its publish syncs.
-        dirtyChannelIds.current.add(channelId);
-        managerRef.current?.publishStars(next);
+        manager?.publishStars(next);
         return next;
       });
     },

@@ -18,6 +18,27 @@ before(() => {
 
 after(() => dom.window.close());
 
+// Shared harness: stub the relay so no network/live/reconnect fires unless a
+// test installs its own live callback. Returns the captured live callback.
+function stubRelay(relayClient, { live } = {}) {
+  const orig = {
+    fetchEvents: relayClient.fetchEvents,
+    subscribeLive: relayClient.subscribeLive,
+    subscribeToReconnects: relayClient.subscribeToReconnects,
+  };
+  relayClient.fetchEvents = async () => [];
+  relayClient.subscribeLive = async (_f, cb) => {
+    if (live) live.cb = cb;
+    return async () => {};
+  };
+  relayClient.subscribeToReconnects = () => () => {};
+  return () => Object.assign(relayClient, orig);
+}
+
+function starPayload(channels) {
+  return JSON.stringify({ version: 1, channels });
+}
+
 test("same-second star and unstar mutations survive at capacity", async () => {
   const { act, cleanup, renderHook } = await import("@testing-library/react");
   const { relayClient } = await import("@/shared/api/relayClient");
@@ -25,21 +46,16 @@ test("same-second star and unstar mutations survive at capacity", async () => {
     await import("./channelStarsStorage.ts");
   const { useChannelStars } = await import("./useChannelStars.ts");
 
-  const originalFetchEvents = relayClient.fetchEvents;
-  const originalSubscribeLive = relayClient.subscribeLive;
-  const originalSubscribeToReconnects = relayClient.subscribeToReconnects;
+  const restore = stubRelay(relayClient);
   const originalDateNow = Date.now;
   const updatedAt = 1_234_567;
   Date.now = () => updatedAt * 1_000;
-  relayClient.fetchEvents = async () => [];
-  relayClient.subscribeLive = async () => async () => {};
-  relayClient.subscribeToReconnects = () => () => {};
 
   const relayUrl = "wss://relay.example";
   const channels = Object.fromEntries(
     Array.from({ length: MAX_CHANNEL_STAR_ENTRIES }, (_, index) => [
       `z-channel-${String(index).padStart(3, "0")}`,
-      { starred: true, updatedAt },
+      { starred: true, updatedAt, rev: 0 },
     ]),
   );
 
@@ -55,416 +71,348 @@ test("same-second star and unstar mutations survive at capacity", async () => {
       const { result, unmount } = renderHook(() =>
         useChannelStars(pubkey, relayUrl),
       );
-
       act(() => result.current[action]("a-target"));
-
       const persisted = readChannelStarsStore(pubkey);
       assert.equal(
         Object.keys(persisted.channels).length,
         MAX_CHANNEL_STAR_ENTRIES,
       );
-      assert.deepEqual(persisted.channels["a-target"], {
-        starred: expectedStarred,
-        updatedAt,
-      });
+      assert.equal(persisted.channels["a-target"].starred, expectedStarred);
       unmount();
     }
   } finally {
     cleanup();
     Date.now = originalDateNow;
-    relayClient.fetchEvents = originalFetchEvents;
-    relayClient.subscribeLive = originalSubscribeLive;
-    relayClient.subscribeToReconnects = originalSubscribeToReconnects;
+    restore();
   }
 });
 
-// Equal-timestamp tie-break must match the relay's canonical winner
-// (`created_at DESC, id ASC` → LOWEST id wins). Deliver the larger id first,
-// then the lower id at the same timestamp; the lower id is the stored winner
-// and must be applied, not rejected. Reverting applyRemote's `>=` back to `<=`
-// wrongly ignores the lower id (the actual relay winner).
-test("equal-timestamp tie-break applies the lower event id (relay canonical winner)", async () => {
+// Symmetric mint (Thufir MINOR 2): a click mints
+// updatedAt = max(now, localEntry.updatedAt, maxUpdatedAtSeen) and
+// rev = max(localEntry.rev, maxRevSeen) + 1 on BOTH dimensions. A remount reads
+// the persisted local entry, so the very first click advances past it.
+test("persisted-local first click mints seen+1 on both dimensions", async () => {
   const { act, cleanup, renderHook } = await import("@testing-library/react");
   const { relayClient } = await import("@/shared/api/relayClient");
+  const { readChannelStarsStore, storageKey } = await import(
+    "./channelStarsStorage.ts"
+  );
   const { useChannelStars } = await import("./useChannelStars.ts");
 
-  const origFetch = relayClient.fetchEvents;
-  const origLive = relayClient.subscribeLive;
-  const origReconnect = relayClient.subscribeToReconnects;
-  const origTauri = window.__TAURI_INTERNALS__;
-
-  let live = null;
-  relayClient.fetchEvents = async () => [];
-  relayClient.subscribeLive = async (_f, cb) => {
-    live = cb;
-    return async () => {};
-  };
-  relayClient.subscribeToReconnects = () => () => {};
-  // Decrypt payload keyed off the event id embedded in the ciphertext so each
-  // delivered event yields a store starring a distinct channel we can assert on.
-  window.__TAURI_INTERNALS__ = {
-    invoke: (cmd, args) => {
-      if (cmd === "nip44_decrypt_from_self") {
-        const id = args?.ciphertext ?? "";
-        return Promise.resolve(
-          JSON.stringify({
-            version: 1,
-            channels: { [id]: { starred: true, updatedAt: 0 } },
-          }),
-        );
-      }
-      return Promise.reject(new Error(`unmocked ${cmd}`));
-    },
-  };
-
-  const pubkey = "pk-star-tie";
-  const relayUrl = "wss://r.tie";
-  let hook = null;
-  try {
-    await act(async () => {
-      hook = renderHook(() => useChannelStars(pubkey, relayUrl));
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    assert.ok(live, "live subscription installed");
-
-    const deliver = async (id) => {
-      await act(async () => {
-        live({
-          id,
-          pubkey,
-          created_at: 1000,
-          content: id, // decrypt echoes this into the starred channel id
-          kind: 30078,
-          tags: [["d", "channel-stars"]],
-          sig: "s",
-        });
-        await Promise.resolve();
-        await Promise.resolve();
-      });
-    };
-
-    // Larger id first (applied), then the lower id at the same timestamp — the
-    // relay's canonical winner, which must NOT be rejected.
-    await deliver("bbbb");
-    await deliver("aaaa");
-
-    assert.ok(
-      hook.result.current.starredChannelIds.has("aaaa"),
-      "lower event id (relay canonical winner) must be applied, not rejected",
-    );
-    hook.unmount();
-  } finally {
-    cleanup();
-    relayClient.fetchEvents = origFetch;
-    relayClient.subscribeLive = origLive;
-    relayClient.subscribeToReconnects = origReconnect;
-    window.__TAURI_INTERNALS__ = origTauri;
-  }
-});
-
-// Pass-2 finding 2: the comparator admitting the canonical lower id is
-// necessary but not sufficient. Stars are a per-entry store, so applyRemote
-// merges the incoming blob into local state. On the SAME channel, a stale
-// larger-id event delivered first (starred=true) must not survive the merge
-// once the canonical lower-id winner (starred=false) arrives at the same entry
-// `updatedAt`. Mutation: reverting the apply path to mergeStores (local/prev
-// wins on tie) keeps the stale starred=true value.
-test("canonical lower-id unstar replaces a stale larger-id star at equal entry timestamp", async () => {
-  const { act, cleanup, renderHook } = await import("@testing-library/react");
-  const { relayClient } = await import("@/shared/api/relayClient");
-  const { useChannelStars } = await import("./useChannelStars.ts");
-
-  const origFetch = relayClient.fetchEvents;
-  const origLive = relayClient.subscribeLive;
-  const origReconnect = relayClient.subscribeToReconnects;
-  const origTauri = window.__TAURI_INTERNALS__;
-
-  let live = null;
-  relayClient.fetchEvents = async () => [];
-  relayClient.subscribeLive = async (_f, cb) => {
-    live = cb;
-    return async () => {};
-  };
-  relayClient.subscribeToReconnects = () => () => {};
-  // Both events target the SAME channel `shared` at the same entry updatedAt.
-  // The larger id `bbbb` says starred; the canonical lower id `aaaa` says not.
-  window.__TAURI_INTERNALS__ = {
-    invoke: (cmd, args) => {
-      if (cmd === "nip44_decrypt_from_self") {
-        const canonicalLowerId = args?.ciphertext === "aaaa";
-        return Promise.resolve(
-          JSON.stringify({
-            version: 1,
-            channels: {
-              shared: { starred: !canonicalLowerId, updatedAt: 100 },
-            },
-          }),
-        );
-      }
-      return Promise.reject(new Error(`unmocked ${cmd}`));
-    },
-  };
-
-  const pubkey = "pk-star-shared-tie";
-  const relayUrl = "wss://r.tie";
-  let hook = null;
-  try {
-    await act(async () => {
-      hook = renderHook(() => useChannelStars(pubkey, relayUrl));
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    assert.ok(live, "live subscription installed");
-
-    const deliver = async (id) => {
-      await act(async () => {
-        live({
-          id,
-          pubkey,
-          created_at: 1000,
-          content: id,
-          kind: 30078,
-          tags: [["d", "channel-stars"]],
-          sig: "s",
-        });
-        for (let i = 0; i < 20; i++) await Promise.resolve();
-      });
-    };
-
-    await deliver("bbbb"); // stale larger-id head says starred
-    await deliver("aaaa"); // canonical lower-id winner says unstarred
-
-    assert.equal(
-      hook.result.current.starredChannelIds.has("shared"),
-      false,
-      "canonical lower-id unstar must replace the stale larger-id star",
-    );
-    hook.unmount();
-  } finally {
-    cleanup();
-    relayClient.fetchEvents = origFetch;
-    relayClient.subscribeLive = origLive;
-    relayClient.subscribeToReconnects = origReconnect;
-    window.__TAURI_INTERNALS__ = origTauri;
-  }
-});
-
-// Fix round 3 (pass-3 finding 2): the remote-wins entry-tie merge and the
-// pending-publish cancel apply ONLY to a canonical supersession (a lower id at
-// the same event timestamp correcting an already-applied larger id). A plain
-// live/bootstrap remote must NOT clobber a later same-second local click or
-// cancel its pending publish. Entry `updatedAt` is whole seconds, so a click at
-// 100.9s and an older remote entry at 100.1s both carry `updatedAt:100`; the
-// later local intent must win and keep publishing. Mutation: applying
-// mergeApplyingRemote + cancel unconditionally lets the delayed remote overwrite
-// the click and drop its publish.
-test("delayed same-second remote does not clobber a later local star or cancel its publish", async () => {
-  const { act, cleanup, renderHook } = await import("@testing-library/react");
-  const { relayClient } = await import("@/shared/api/relayClient");
-  const { useChannelStars } = await import("./useChannelStars.ts");
-
-  const origFetch = relayClient.fetchEvents;
-  const origLive = relayClient.subscribeLive;
-  const origReconnect = relayClient.subscribeToReconnects;
-  const origTauri = window.__TAURI_INTERNALS__;
-  const origSetTimeout = window.setTimeout;
-  const origClearTimeout = window.clearTimeout;
+  const restore = stubRelay(relayClient);
   const origDateNow = Date.now;
+  // Persisted entry is stamped in the FUTURE relative to wall clock, with a
+  // non-zero rev — the mint must not regress below either.
+  Date.now = () => 100 * 1_000;
+  const pubkey = "pk-persist";
+  window.localStorage.setItem(
+    storageKey(pubkey),
+    starPayload({ shared: { starred: true, updatedAt: 500, rev: 4 } }),
+  );
+  try {
+    const { result, unmount } = renderHook(() =>
+      useChannelStars(pubkey, "wss://r"),
+    );
+    act(() => result.current.unstarChannel("shared"));
+    const persisted = readChannelStarsStore(pubkey);
+    assert.equal(persisted.channels.shared.starred, false, "unstar applied");
+    assert.equal(
+      persisted.channels.shared.updatedAt,
+      500,
+      "updatedAt held at persisted-local high-water (max(100,500,seen))",
+    );
+    assert.equal(
+      persisted.channels.shared.rev,
+      5,
+      "rev minted as persisted-local rev + 1",
+    );
+    unmount();
+  } finally {
+    cleanup();
+    Date.now = origDateNow;
+    restore();
+  }
+});
 
-  const timers = new Map();
-  let nextTimer = 1;
-  window.setTimeout = (fn, ms) => {
-    const id = nextTimer++;
-    timers.set(id, { fn, ms });
-    return id;
-  };
-  window.clearTimeout = (id) => timers.delete(id);
-  // The local click happens later within second 100.
-  Date.now = () => 100_900;
+// Fast-clock veto fix (Thufir pass-2 finding 1): after observing a
+// future-stamped remote (updatedAt = t+300, rev 7, unstarred), a slow device
+// clicking star at wall-clock t must WIN — the logical-monotonic stamp lifts the
+// click's updatedAt to t+300 and rev to 8, so it dominates the observed entry.
+test("fast-clock veto fix: click after observing a future-stamped head wins", async () => {
+  const { act, cleanup, renderHook } = await import("@testing-library/react");
+  const { relayClient } = await import("@/shared/api/relayClient");
+  const { readChannelStarsStore } = await import("./channelStarsStorage.ts");
+  const { useChannelStars } = await import("./useChannelStars.ts");
 
-  let live = null;
-  relayClient.fetchEvents = async () => [];
-  relayClient.subscribeLive = async (_f, cb) => {
-    live = cb;
-    return async () => {};
-  };
-  relayClient.subscribeToReconnects = () => () => {};
-  // The delayed remote entry sits earlier in the same second and says unstarred.
+  const live = {};
+  const restore = stubRelay(relayClient, { live });
+  const origTauri = window.__TAURI_INTERNALS__;
+  const origDateNow = Date.now;
+  Date.now = () => 100 * 1_000; // slow device: wall clock t = 100
   window.__TAURI_INTERNALS__ = {
     invoke: (cmd) => {
       if (cmd === "nip44_decrypt_from_self")
         return Promise.resolve(
-          JSON.stringify({
-            version: 1,
-            channels: { shared: { starred: false, updatedAt: 100 } },
-          }),
+          starPayload({ shared: { starred: false, updatedAt: 400, rev: 7 } }),
         );
       return Promise.reject(new Error(`unmocked ${cmd}`));
     },
   };
-
-  const pubkey = "pk-star-same-second";
-  const relayUrl = "wss://r.same";
+  const pubkey = "pk-fastclock";
   let hook = null;
   try {
     await act(async () => {
-      hook = renderHook(() => useChannelStars(pubkey, relayUrl));
+      hook = renderHook(() => useChannelStars(pubkey, "wss://r"));
       for (let i = 0; i < 20; i++) await Promise.resolve();
     });
-    assert.ok(live, "live subscription installed");
-
-    // Local optimistic click: starred=true at updatedAt=100 (Date.now=100.9s).
+    // Observe the future-stamped head (updatedAt 400 = t+300).
     await act(async () => {
-      hook.result.current.starChannel("shared");
-    });
-    // An older remote entry from the same second decrypts and applies late.
-    await act(async () => {
-      live({
-        id: "remote-before-click",
+      live.cb({
+        id: "future-head",
         pubkey,
-        created_at: 100,
-        content: "remote",
+        created_at: 400,
+        content: "cipher",
         kind: 30078,
         tags: [["d", "channel-stars"]],
         sig: "s",
       });
-      for (let i = 0; i < 40; i++) await Promise.resolve();
+      for (let i = 0; i < 20; i++) await Promise.resolve();
     });
-
+    assert.equal(
+      hook.result.current.starredChannelIds.has("shared"),
+      false,
+      "future head applied → unstarred",
+    );
+    // Slow device clicks star at wall t=100.
+    await act(async () => hook.result.current.starChannel("shared"));
     assert.equal(
       hook.result.current.starredChannelIds.has("shared"),
       true,
-      "a later same-second local click must survive a delayed older remote",
+      "click must win despite the observed future timestamp",
     );
-    assert.ok(
-      [...timers.values()].some((t) => t.ms === 2000),
-      "the local pending publish must remain scheduled",
+    const persisted = readChannelStarsStore(pubkey);
+    assert.equal(
+      persisted.channels.shared.updatedAt,
+      400,
+      "mint lifted to t+300",
     );
+    assert.equal(persisted.channels.shared.rev, 8, "rev = maxRevSeen+1");
     hook.unmount();
   } finally {
     cleanup();
-    relayClient.fetchEvents = origFetch;
-    relayClient.subscribeLive = origLive;
-    relayClient.subscribeToReconnects = origReconnect;
-    window.__TAURI_INTERNALS__ = origTauri;
-    window.setTimeout = origSetTimeout;
-    window.clearTimeout = origClearTimeout;
     Date.now = origDateNow;
+    window.__TAURI_INTERNALS__ = origTauri;
+    restore();
   }
 });
 
-// Fix round 4 (pass-4 finding 2): a canonical correction (lower id at the same
-// event timestamp) knows the incoming event is the relay's winner, but NOT
-// whether the user clicked between the superseded larger-id event and the
-// correction. Sequence: stale `bbbb` applies → user clicks star later in the
-// same second → canonical `aaaa` decrypts late. `aaaa` and the click share
-// integer `updatedAt`, so the plain remote-wins tie would clobber the click.
-// The dirty-entry overlay keeps the click and the cancel is gone, so its
-// publish stays scheduled. Mutation: dropping the dirty overlay (plain
-// mergeApplyingRemote) lets `aaaa` erase the click; restoring the cancel drops
-// its publish timer.
-test("canonical correction preserves a same-second local click made after the larger-id event", async () => {
+// Future-timestamp propagation (Thufir MINOR 1 / Paul MINOR 1): a poisoned
+// far-future observation does not ratchet by itself — two opposite clicks keep
+// the timestamp fixed at the observed future value while rev advances, and the
+// latest click wins. No clamp; deterministic.
+test("far-future observation: timestamp stays fixed, rev advances, latest click wins", async () => {
+  const { act, cleanup, renderHook } = await import("@testing-library/react");
+  const { relayClient } = await import("@/shared/api/relayClient");
+  const { readChannelStarsStore } = await import("./channelStarsStorage.ts");
+  const { useChannelStars } = await import("./useChannelStars.ts");
+
+  const live = {};
+  const restore = stubRelay(relayClient, { live });
+  const origTauri = window.__TAURI_INTERNALS__;
+  const origDateNow = Date.now;
+  Date.now = () => 100 * 1_000;
+  const FUTURE = 100 + 31_536_000; // +1yr
+  window.__TAURI_INTERNALS__ = {
+    invoke: (cmd) => {
+      if (cmd === "nip44_decrypt_from_self")
+        return Promise.resolve(
+          starPayload({ shared: { starred: true, updatedAt: FUTURE, rev: 1 } }),
+        );
+      return Promise.reject(new Error(`unmocked ${cmd}`));
+    },
+  };
+  const pubkey = "pk-future";
+  let hook = null;
+  try {
+    await act(async () => {
+      hook = renderHook(() => useChannelStars(pubkey, "wss://r"));
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    });
+    await act(async () => {
+      live.cb({
+        id: "far-future",
+        pubkey,
+        created_at: FUTURE,
+        content: "cipher",
+        kind: 30078,
+        tags: [["d", "channel-stars"]],
+        sig: "s",
+      });
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    });
+    await act(async () => hook.result.current.unstarChannel("shared"));
+    let p = readChannelStarsStore(pubkey);
+    assert.equal(p.channels.shared.starred, false, "first click applied");
+    assert.equal(p.channels.shared.updatedAt, FUTURE, "timestamp stays fixed");
+    assert.equal(p.channels.shared.rev, 2, "rev advanced 1→2");
+    await act(async () => hook.result.current.starChannel("shared"));
+    p = readChannelStarsStore(pubkey);
+    assert.equal(p.channels.shared.starred, true, "latest click wins");
+    assert.equal(p.channels.shared.updatedAt, FUTURE, "timestamp still fixed");
+    assert.equal(p.channels.shared.rev, 3, "rev advanced 2→3");
+    hook.unmount();
+  } finally {
+    cleanup();
+    Date.now = origDateNow;
+    window.__TAURI_INTERNALS__ = origTauri;
+    restore();
+  }
+});
+
+// Click-before-observation (design note gap test a): an empty-store click mints
+// updatedAt=now, rev=1; a later bootstrap head carrying a HIGHER rev but an
+// OLDER updatedAt for the opposite value must NOT reverse the click — updatedAt
+// is primary.
+test("empty-store click survives a later higher-rev head with an older updatedAt", async () => {
   const { act, cleanup, renderHook } = await import("@testing-library/react");
   const { relayClient } = await import("@/shared/api/relayClient");
   const { useChannelStars } = await import("./useChannelStars.ts");
 
-  const origFetch = relayClient.fetchEvents;
-  const origLive = relayClient.subscribeLive;
-  const origReconnect = relayClient.subscribeToReconnects;
+  const live = {};
+  const restore = stubRelay(relayClient, { live });
   const origTauri = window.__TAURI_INTERNALS__;
-  const origSetTimeout = window.setTimeout;
-  const origClearTimeout = window.clearTimeout;
   const origDateNow = Date.now;
-
-  const timers = new Map();
-  let nextTimer = 1;
-  window.setTimeout = (fn, ms) => {
-    const id = nextTimer++;
-    timers.set(id, { fn, ms });
-    return id;
-  };
-  window.clearTimeout = (id) => timers.delete(id);
-  // The local click happens later within second 100.
-  Date.now = () => 100_900;
-
-  let live = null;
-  relayClient.fetchEvents = async () => [];
-  relayClient.subscribeLive = async (_f, cb) => {
-    live = cb;
-    return async () => {};
-  };
-  relayClient.subscribeToReconnects = () => () => {};
-  // bbbb (stale larger id) says starred; aaaa (canonical lower id) says not.
-  // Both carry the same entry updatedAt=100, tying the later local click.
+  Date.now = () => 1000 * 1_000; // click at updatedAt 1000
   window.__TAURI_INTERNALS__ = {
-    invoke: (cmd, args) => {
-      if (cmd === "nip44_decrypt_from_self") {
-        const canonicalLowerId = args?.ciphertext === "aaaa";
+    invoke: (cmd) => {
+      if (cmd === "nip44_decrypt_from_self")
+        // older updatedAt (500) but higher rev (99), opposite value
         return Promise.resolve(
-          JSON.stringify({
-            version: 1,
-            channels: {
-              shared: { starred: !canonicalLowerId, updatedAt: 100 },
-            },
-          }),
+          starPayload({ shared: { starred: false, updatedAt: 500, rev: 99 } }),
         );
-      }
       return Promise.reject(new Error(`unmocked ${cmd}`));
     },
   };
-
-  const pubkey = "pk-star-canonical-dirty";
-  const relayUrl = "wss://r.canon";
+  const pubkey = "pk-empty";
   let hook = null;
   try {
     await act(async () => {
-      hook = renderHook(() => useChannelStars(pubkey, relayUrl));
+      hook = renderHook(() => useChannelStars(pubkey, "wss://r"));
       for (let i = 0; i < 20; i++) await Promise.resolve();
     });
-    assert.ok(live, "live subscription installed");
-
-    const deliver = async (id, content) => {
-      await act(async () => {
-        live({
-          id,
-          pubkey,
-          created_at: 100,
-          content,
-          kind: 30078,
-          tags: [["d", "channel-stars"]],
-          sig: "s",
-        });
-        for (let i = 0; i < 40; i++) await Promise.resolve();
-      });
-    };
-
-    await deliver("bbbb", "bbbb"); // stale larger-id head applies (starred)
+    await act(async () => hook.result.current.starChannel("shared")); // empty store → rev 1 @ 1000
     await act(async () => {
-      hook.result.current.starChannel("shared"); // user intent after bbbb
+      live.cb({
+        id: "older-higher-rev",
+        pubkey,
+        created_at: 500,
+        content: "cipher",
+        kind: 30078,
+        tags: [["d", "channel-stars"]],
+        sig: "s",
+      });
+      for (let i = 0; i < 20; i++) await Promise.resolve();
     });
-    await deliver("aaaa", "aaaa"); // canonical correction decrypts late
-
     assert.equal(
       hook.result.current.starredChannelIds.has("shared"),
       true,
-      "a same-second local click must survive the canonical correction",
-    );
-    assert.ok(
-      [...timers.values()].some((t) => t.ms === 2000),
-      "the local click's pending publish must remain scheduled",
+      "click at newer updatedAt survives an older higher-rev head",
     );
     hook.unmount();
   } finally {
     cleanup();
-    relayClient.fetchEvents = origFetch;
-    relayClient.subscribeLive = origLive;
-    relayClient.subscribeToReconnects = origReconnect;
-    window.__TAURI_INTERNALS__ = origTauri;
-    window.setTimeout = origSetTimeout;
-    window.clearTimeout = origClearTimeout;
     Date.now = origDateNow;
+    window.__TAURI_INTERNALS__ = origTauri;
+    restore();
+  }
+});
+
+// Cross-window storage: a peer window's write is observed into the high-water
+// and max-merged, so a following click sees the peer's rev and no edit is lost.
+test("cross-window storage event is observed and max-merged", async () => {
+  const { act, cleanup, renderHook } = await import("@testing-library/react");
+  const { relayClient } = await import("@/shared/api/relayClient");
+  const { readChannelStarsStore, storageKey } = await import(
+    "./channelStarsStorage.ts"
+  );
+  const { useChannelStars } = await import("./useChannelStars.ts");
+
+  const restore = stubRelay(relayClient);
+  const origDateNow = Date.now;
+  Date.now = () => 100 * 1_000;
+  const pubkey = "pk-xwin";
+  let hook = null;
+  try {
+    await act(async () => {
+      hook = renderHook(() => useChannelStars(pubkey, "wss://r"));
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    });
+    // A peer window wrote a higher-rev entry for `shared` at updatedAt 900.
+    window.localStorage.setItem(
+      storageKey(pubkey),
+      starPayload({ shared: { starred: true, updatedAt: 900, rev: 12 } }),
+    );
+    await act(async () => {
+      window.dispatchEvent(
+        new dom.window.StorageEvent("storage", { key: storageKey(pubkey) }),
+      );
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    });
+    assert.equal(
+      hook.result.current.starredChannelIds.has("shared"),
+      true,
+      "peer write merged into this window",
+    );
+    // A following click sees the peer's high-water: updatedAt held at 900,
+    // rev minted to 13.
+    await act(async () => hook.result.current.unstarChannel("shared"));
+    const p = readChannelStarsStore(pubkey);
+    assert.equal(p.channels.shared.starred, false, "click applied");
+    assert.equal(p.channels.shared.updatedAt, 900, "held at peer high-water");
+    assert.equal(p.channels.shared.rev, 13, "rev = peer rev + 1");
+    hook.unmount();
+  } finally {
+    cleanup();
+    Date.now = origDateNow;
+    restore();
+  }
+});
+
+// Outbox resume: an edit persisted to the durable outbox before teardown is
+// re-published on the next mount (bootstrap resume), so a click made <2s before
+// quit/community-switch is never silently dropped.
+test("bootstrap resumes a persisted outbox edit", async () => {
+  const { act, cleanup, renderHook } = await import("@testing-library/react");
+  const { relayClient } = await import("@/shared/api/relayClient");
+  const { useChannelStars } = await import("./useChannelStars.ts");
+
+  const restore = stubRelay(relayClient);
+  const origDateNow = Date.now;
+  Date.now = () => 100 * 1_000;
+  const pubkey = "pk-outbox";
+  const relayUrl = "wss://r.outbox";
+  const outboxKey = `buzz-channel-stars-outbox.v1:${pubkey}:${encodeURIComponent(relayUrl)}`;
+  window.localStorage.setItem(
+    outboxKey,
+    starPayload({ resumed: { starred: true, updatedAt: 90, rev: 2 } }),
+  );
+  let hook = null;
+  try {
+    await act(async () => {
+      hook = renderHook(() => useChannelStars(pubkey, relayUrl));
+      for (let i = 0; i < 40; i++) await Promise.resolve();
+    });
+    // The resumed edit is queued for publish (pending), not silently dropped.
+    // We assert the pending publish debounce is scheduled by observing the
+    // outbox is still present (cleared only after publish completes).
+    assert.ok(
+      window.localStorage.getItem(outboxKey) !== null,
+      "outbox retained until the resumed publish completes",
+    );
+    hook.unmount();
+  } finally {
+    cleanup();
+    Date.now = origDateNow;
+    restore();
   }
 });

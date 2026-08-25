@@ -1,9 +1,16 @@
+import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
+
 const STORAGE_KEY_PREFIX = "buzz-channel-stars.v1";
 export const MAX_CHANNEL_STAR_ENTRIES = 500;
 
 export type ChannelStarEntry = {
   starred: boolean;
   updatedAt: number;
+  // Per-channel Lamport revision. Breaks a same-second `updatedAt` tie that the
+  // integer clock cannot resolve. Absent in blobs from an older build ⇒ read as
+  // 0 (a valid, mergeable value), so the payload stays `version: 1` and older
+  // builds still parse our blobs.
+  rev: number;
 };
 
 export type ChannelStarStore = {
@@ -29,8 +36,8 @@ export function parseStarPayload(json: unknown): ChannelStarStore | null {
     obj.channels !== null &&
     !Array.isArray(obj.channels)
       ? Object.fromEntries(
-          Object.entries(obj.channels as Record<string, unknown>).filter(
-            (entry): entry is [string, ChannelStarEntry] => {
+          Object.entries(obj.channels as Record<string, unknown>)
+            .filter((entry): entry is [string, Record<string, unknown>] => {
               const v = entry[1];
               return (
                 typeof v === "object" &&
@@ -42,8 +49,27 @@ export function parseStarPayload(json: unknown): ChannelStarStore | null {
                 ) &&
                 ((v as Record<string, unknown>).updatedAt as number) >= 0
               );
-            },
-          ),
+            })
+            // Normalize `rev`: accept a non-negative integer, otherwise 0. An
+            // entry is never dropped solely because `rev` is absent (older
+            // build) or malformed — absence is a valid mergeable value.
+            .map(([id, v]) => {
+              const rawRev = v.rev;
+              const rev =
+                typeof rawRev === "number" &&
+                Number.isInteger(rawRev) &&
+                rawRev >= 0
+                  ? rawRev
+                  : 0;
+              return [
+                id,
+                {
+                  starred: v.starred as boolean,
+                  updatedAt: v.updatedAt as number,
+                  rev,
+                },
+              ];
+            }),
         )
       : {};
   return boundStarStore({ version: 1, channels });
@@ -108,79 +134,47 @@ export function writeChannelStarsStore(
   }
 }
 
-export function mergeStores(
-  local: ChannelStarStore,
-  remote: ChannelStarStore,
-): ChannelStarStore {
-  return mergeStoresWithTie(local, remote, false);
-}
-
 /**
- * Merge a remote store that has already won the event-level canonical tie-break
- * (`created_at DESC, id ASC`) into the local store, resolving a per-entry
- * `updatedAt` tie in favour of the *remote* value. Once the comparator has
- * chosen this remote event as the stored winner, its per-entry values must
- * survive, or a stale value from a superseded larger-id event delivered first
- * would win the merge and silently undo the canonical winner. Strictly-newer
- * local per-entry edits (`l.updatedAt > r.updatedAt`) still win.
+ * Merge two star stores by a per-channel total order:
+ * `updatedAt` DESC → `rev` DESC → `starred === true` wins. This order is
+ * commutative, associative, and idempotent (before bounding), so every
+ * observation path (bootstrap, live, reconnect, reconcile, pre-publish,
+ * cross-window storage) applies it with no ordering or ownership overlay and
+ * all replicas converge.
+ *
+ * `updatedAt` is primary so a strictly-later edit — from any build, whether it
+ * carries `rev` or (older build) reads `rev: 0` — wins outright. `rev` breaks
+ * only a same-second `updatedAt` tie: the ambiguous integer-second window the
+ * clock cannot resolve, where a click that minted `rev = maxSeen + 1` dominates
+ * any same-second state it observed. On a full tie (equal `updatedAt` AND equal
+ * `rev`) `true` wins as the deterministic leaf.
  */
-export function mergeApplyingRemote(
-  local: ChannelStarStore,
-  remote: ChannelStarStore,
-): ChannelStarStore {
-  return mergeStoresWithTie(local, remote, true);
-}
-
-function mergeStoresWithTie(
-  local: ChannelStarStore,
-  remote: ChannelStarStore,
-  preferRemoteOnTie: boolean,
+export function mergeStores(
+  a: ChannelStarStore,
+  b: ChannelStarStore,
 ): ChannelStarStore {
   const allIds = new Set([
-    ...Object.keys(local.channels),
-    ...Object.keys(remote.channels),
+    ...Object.keys(a.channels),
+    ...Object.keys(b.channels),
   ]);
   const merged: Record<string, ChannelStarEntry> = {};
   for (const id of allIds) {
-    const l = local.channels[id];
-    const r = remote.channels[id];
-    if (l && r) {
-      const localWins = preferRemoteOnTie
-        ? l.updatedAt > r.updatedAt
-        : l.updatedAt >= r.updatedAt;
-      merged[id] = localWins ? l : r;
-    } else {
-      merged[id] = (l ?? r) as ChannelStarEntry;
-    }
+    const l = a.channels[id];
+    const r = b.channels[id];
+    merged[id] = l && r ? pickStarEntry(l, r) : ((l ?? r) as ChannelStarEntry);
   }
   return boundStarStore({ version: 1, channels: merged });
 }
 
-/**
- * Apply a canonical lower-id correction (`mergeApplyingRemote`: remote wins a
- * per-entry `updatedAt` tie) while preserving entries the user changed locally
- * since the superseded head was applied. The correction canonicalises remote
- * history, but a same-second local click carries integer-second `updatedAt`
- * equal to the remote's, so the plain remote-wins tie would silently clobber
- * it. For each `dirtyId` the local entry wins only the tie (`l.updatedAt >=
- * r.updatedAt`) — a genuinely newer remote value still wins, so a stale dirty
- * id can never override a later correction.
- */
-export function mergeCanonicalSupersession(
-  local: ChannelStarStore,
-  remote: ChannelStarStore,
-  dirtyIds: ReadonlySet<string>,
-): ChannelStarStore {
-  const applied = mergeApplyingRemote(local, remote);
-  if (dirtyIds.size === 0) return applied;
-  const channels = { ...applied.channels };
-  for (const id of dirtyIds) {
-    const l = local.channels[id];
-    if (!l) continue;
-    const r = remote.channels[id];
-    if (!r || l.updatedAt >= r.updatedAt) channels[id] = l;
-  }
-  return boundStarStore({ version: 1, channels });
+/** The winner of two entries under `updatedAt` → `rev` → `starred` order. */
+function pickStarEntry(
+  l: ChannelStarEntry,
+  r: ChannelStarEntry,
+): ChannelStarEntry {
+  if (l.updatedAt !== r.updatedAt) return l.updatedAt > r.updatedAt ? l : r;
+  if (l.rev !== r.rev) return l.rev > r.rev ? l : r;
+  if (l.starred !== r.starred) return l.starred ? l : r;
+  return l;
 }
 
 export function starredChannelIdsFromStore(
@@ -191,4 +185,63 @@ export function starredChannelIdsFromStore(
       .filter(([, entry]) => entry.starred)
       .map(([id]) => id),
   );
+}
+
+const OUTBOX_KEY_PREFIX = "buzz-channel-stars-outbox.v1";
+
+// The outbox is a per-relay sync-lane structure (like the watermark), so it is
+// relay-scoped even though the main store stays pubkey-only: an edit made
+// against relay A must never resume-publish onto relay B after a community
+// switch.
+function outboxKey(pubkey: string, relayUrl: string): string {
+  return `${OUTBOX_KEY_PREFIX}:${pubkey}:${encodeURIComponent(normalizeRelayUrl(relayUrl))}`;
+}
+
+/**
+ * Persist an unpublished edit so it survives quit/community-switch within the
+ * 2s publish debounce. Written synchronously on every click; cleared once the
+ * edit is published or found identical to the last published store. Resumed on
+ * next mount so a durable intent is never silently dropped at teardown.
+ */
+export function writeChannelStarsOutbox(
+  pubkey: string,
+  store: ChannelStarStore,
+  relayUrl: string,
+): void {
+  try {
+    window.localStorage.setItem(
+      outboxKey(pubkey, relayUrl),
+      JSON.stringify(boundStarStore(store)),
+    );
+  } catch {
+    // Best-effort durability; the in-memory pendingStore still drives this
+    // session's publish even if the persisted copy could not be written.
+  }
+}
+
+/** Read a persisted unpublished edit, or null when none/unparseable. */
+export function readChannelStarsOutbox(
+  pubkey: string,
+  relayUrl: string,
+): ChannelStarStore | null {
+  try {
+    const raw = window.localStorage.getItem(outboxKey(pubkey, relayUrl));
+    if (!raw) return null;
+    return parseStarPayload(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+/** Clear the persisted outbox (edit published or a no-op). */
+export function clearChannelStarsOutbox(
+  pubkey: string,
+  relayUrl: string,
+): void {
+  try {
+    window.localStorage.removeItem(outboxKey(pubkey, relayUrl));
+  } catch {
+    // Ignore — a stale outbox entry is re-evaluated (and re-cleared if
+    // identical to the head) on the next publish attempt.
+  }
 }
