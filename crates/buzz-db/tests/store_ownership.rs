@@ -1041,3 +1041,27 @@ fn git_repo_store_has_single_ownership() {
     assert_eq!(count(root, "enum ReserveOutcome"), 0);
     assert_eq!(count(store, "enum ReserveOutcome"), 1);
 }
+
+#[test]
+fn archived_identities_store_has_single_ownership() {
+    let root = include_str!("../src/lib.rs");
+    let store = include_str!("../src/archived_identities.rs");
+
+    for method in ["is_archived", "archive", "unarchive", "list_archived"] {
+        let signature = format!("pub async fn {method}(");
+        assert_eq!(count(root, &signature), 0, "{method} remains in lib.rs");
+        assert_eq!(
+            count(store, &signature),
+            2,
+            "{method} must have one Db wrapper and one archived-identity SQL function"
+        );
+        assert_eq!(
+            count(store, &format!("name = \"{method}\"")),
+            1,
+            "{method} span is not unique"
+        );
+    }
+
+    assert_eq!(count(root, "struct ArchivedIdentity"), 0);
+    assert_eq!(count(store, "struct ArchivedIdentity"), 1);
+}
