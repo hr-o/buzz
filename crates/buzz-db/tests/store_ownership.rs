@@ -805,7 +805,7 @@ fn workflow_lifecycle_store_has_single_ownership() {
     assert_eq!(count(root, "enum WorkflowStatus"), 0);
     assert_eq!(count(store, "enum WorkflowStatus"), 1);
 
-    for deferred in [
+    for method in [
         "create_workflow_run",
         "get_workflow_run",
         "list_workflow_runs",
@@ -818,11 +818,32 @@ fn workflow_lifecycle_store_has_single_ownership() {
         "update_approval",
         "update_approval_by_stored_hash",
     ] {
+        let signature = format!("pub async fn {method}(");
+        assert_eq!(count(root, &signature), 0, "{method} remains in lib.rs");
         assert_eq!(
-            count(root, &format!("pub async fn {deferred}(")),
-            1,
-            "run/approval wrapper moved into the lifecycle slice"
+            count(store, &signature),
+            2,
+            "{method} must have one Db wrapper and one workflow SQL function"
         );
+        assert_eq!(
+            count(store, &format!("name = \"{method}\"")),
+            1,
+            "{method} span is not unique"
+        );
+    }
+
+    for ty in [
+        "WorkflowRunRecord",
+        "WorkflowRunFailure",
+        "ApprovalRecord",
+        "CreateApprovalParams",
+    ] {
+        assert_eq!(count(root, &format!("struct {ty}")), 0);
+        assert_eq!(count(store, &format!("struct {ty}")), 1);
+    }
+    for ty in ["RunStatus", "ApprovalStatus"] {
+        assert_eq!(count(root, &format!("enum {ty}")), 0);
+        assert_eq!(count(store, &format!("enum {ty}")), 1);
     }
 
     assert_eq!(count(root, "pub async fn usage_workflow_counts("), 1);
