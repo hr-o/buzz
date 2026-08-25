@@ -279,3 +279,59 @@ fn allowlist_store_has_single_ownership() {
         "NIP-43 backfill must remain relay-membership owned"
     );
 }
+
+#[test]
+fn reminder_store_has_single_ownership() {
+    let root = include_str!("../src/lib.rs");
+    let events = include_str!("../src/event.rs");
+    let store = include_str!("../src/reminder.rs");
+
+    for method in [
+        "query_due_reminders",
+        "claim_due_reminder",
+        "claim_due_reminder_with_stamp",
+        "release_due_reminder",
+    ] {
+        let signature = format!("pub async fn {method}(");
+        assert_eq!(count(root, &signature), 0, "{method} remains in lib.rs");
+        assert_eq!(count(events, &signature), 0, "{method} remains in event.rs");
+        assert_eq!(
+            count(store, &signature),
+            2,
+            "{method} must have one Db wrapper and one SQL function"
+        );
+        assert_eq!(
+            count(store, &format!("name = \"{method}\"")),
+            1,
+            "{method} span is not unique"
+        );
+    }
+
+    assert_eq!(count(events, "struct DueReminder"), 0);
+    assert_eq!(count(store, "struct DueReminder"), 1);
+
+    for test_name in [
+        "query_due_reminders_returns_row_community_and_host_per_tenant",
+        "claim_due_reminder_is_won_by_exactly_one_of_two_racing_pods",
+        "release_due_reminder_rolls_back_only_the_matching_stamp",
+        "reminder_claim_and_release_are_confined_to_their_community",
+    ] {
+        assert_eq!(
+            count(events, &format!("async fn {test_name}(")),
+            0,
+            "{test_name} remains in event.rs"
+        );
+        assert_eq!(
+            count(store, &format!("async fn {test_name}(")),
+            1,
+            "{test_name} is not singly owned"
+        );
+    }
+
+    assert_eq!(
+        count(events, "pub fn extract_not_before("),
+        1,
+        "event insertion must retain reminder tag materialization"
+    );
+    assert_eq!(count(store, "pub fn extract_not_before("), 0);
+}
