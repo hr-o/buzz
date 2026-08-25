@@ -586,3 +586,84 @@ fn feed_store_has_single_ownership() {
         "cross-domain routing confinement must remain runtime-owned"
     );
 }
+
+#[test]
+fn user_and_dm_stores_have_single_ownership() {
+    let root = include_str!("../src/lib.rs");
+    let users = include_str!("../src/user.rs");
+    let dms = include_str!("../src/dm.rs");
+
+    for method in [
+        "ensure_user",
+        "get_user",
+        "update_user_profile",
+        "get_user_by_nip05",
+        "search_users",
+        "set_agent_owner",
+        "get_agent_channel_policy",
+        "is_agent_owner",
+        "set_channel_add_policy",
+    ] {
+        let signature = format!("pub async fn {method}(");
+        assert_eq!(count(root, &signature), 0, "{method} remains in lib.rs");
+        assert_eq!(
+            count(users, &signature),
+            2,
+            "{method} must have one Db wrapper and one user SQL function"
+        );
+        assert_eq!(count(dms, &signature), 0, "{method} leaked into dm.rs");
+        assert_eq!(
+            count(users, &format!("name = \"{method}\"")),
+            1,
+            "{method} span is not unique"
+        );
+    }
+
+    for method in [
+        "find_dm_by_participants",
+        "create_dm",
+        "list_dms_for_user",
+        "open_dm",
+        "hide_dm",
+        "unhide_dm",
+        "list_hidden_dms",
+    ] {
+        let signature = format!("pub async fn {method}(");
+        assert_eq!(count(root, &signature), 0, "{method} remains in lib.rs");
+        assert_eq!(count(users, &signature), 0, "{method} leaked into user.rs");
+        assert_eq!(
+            count(dms, &signature),
+            2,
+            "{method} must have one Db wrapper and one DM SQL function"
+        );
+        assert_eq!(
+            count(dms, &format!("name = \"{method}\"")),
+            1,
+            "{method} span is not unique"
+        );
+    }
+
+    for ty in ["UserProfile", "UserSearchProfile"] {
+        assert_eq!(count(root, &format!("struct {ty}")), 0);
+        assert_eq!(
+            count(users, &format!("struct {ty}")),
+            1,
+            "{ty} is not singly user-owned"
+        );
+        assert_eq!(count(dms, &format!("struct {ty}")), 0);
+    }
+
+    for ty in ["DmRecord", "DmParticipant"] {
+        assert_eq!(count(root, &format!("struct {ty}")), 0);
+        assert_eq!(count(users, &format!("struct {ty}")), 0);
+        assert_eq!(
+            count(dms, &format!("struct {ty}")),
+            1,
+            "{ty} is not singly DM-owned"
+        );
+    }
+
+    assert_eq!(count(root, "async fn route_read("), 1);
+    assert_eq!(count(users, "async fn route_read("), 0);
+    assert_eq!(count(dms, "async fn route_read("), 0);
+}
