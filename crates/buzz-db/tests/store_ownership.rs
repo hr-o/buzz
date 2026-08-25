@@ -746,3 +746,85 @@ fn push_store_has_single_ownership() {
     assert_eq!(count(root, "async fn route_read("), 1);
     assert_eq!(count(store, "async fn route_read("), 0);
 }
+
+#[test]
+fn workflow_lifecycle_store_has_single_ownership() {
+    let root = include_str!("../src/lib.rs");
+    let store = include_str!("../src/workflow.rs");
+
+    for method in [
+        "create_workflow",
+        "upsert_workflow",
+        "get_workflow",
+        "list_channel_workflows",
+        "list_enabled_channel_workflows",
+        "list_all_enabled_workflows",
+        "claim_scheduled_workflow_fire",
+        "latest_scheduled_workflow_fire",
+        "attach_scheduled_workflow_run",
+        "prune_scheduled_workflow_fires_before",
+        "update_workflow",
+        "update_workflow_status",
+        "set_workflow_enabled",
+        "disable_workflows_for_owner_in_channel",
+        "delete_workflow",
+        "delete_workflow_for_owner",
+    ] {
+        let signature = format!("pub async fn {method}(");
+        assert_eq!(count(root, &signature), 0, "{method} remains in lib.rs");
+        assert_eq!(
+            count(store, &signature),
+            2,
+            "{method} must have one Db wrapper and one workflow SQL function"
+        );
+        assert_eq!(
+            count(store, &format!("name = \"{method}\"")),
+            1,
+            "{method} span is not unique"
+        );
+    }
+
+    assert_eq!(
+        count(root, "pub async fn find_workflow_by_owner_and_name("),
+        0
+    );
+    assert_eq!(
+        count(store, "pub async fn find_workflow_by_owner_and_name("),
+        1
+    );
+    assert_eq!(count(store, "pub async fn find_by_owner_and_name("), 1);
+    assert_eq!(
+        count(store, "name = \"find_workflow_by_owner_and_name\""),
+        1
+    );
+
+    for ty in ["WorkflowRecord", "ScheduledWorkflowFireClaim"] {
+        assert_eq!(count(root, &format!("struct {ty}")), 0);
+        assert_eq!(count(store, &format!("struct {ty}")), 1);
+    }
+    assert_eq!(count(root, "enum WorkflowStatus"), 0);
+    assert_eq!(count(store, "enum WorkflowStatus"), 1);
+
+    for deferred in [
+        "create_workflow_run",
+        "get_workflow_run",
+        "list_workflow_runs",
+        "list_workflow_runs_page",
+        "update_workflow_run",
+        "create_approval",
+        "get_approval",
+        "get_approval_by_stored_hash",
+        "get_run_approvals",
+        "update_approval",
+        "update_approval_by_stored_hash",
+    ] {
+        assert_eq!(
+            count(root, &format!("pub async fn {deferred}(")),
+            1,
+            "run/approval wrapper moved into the lifecycle slice"
+        );
+    }
+
+    assert_eq!(count(root, "pub async fn usage_workflow_counts("), 1);
+    assert_eq!(count(store, "pub async fn usage_workflow_counts("), 0);
+}
