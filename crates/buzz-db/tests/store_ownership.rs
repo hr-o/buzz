@@ -468,3 +468,78 @@ fn thread_store_has_single_ownership() {
     assert_eq!(count(root, "async fn route_read("), 1);
     assert_eq!(count(store, "async fn route_read("), 0);
 }
+
+#[test]
+fn reaction_store_has_single_ownership() {
+    let root = include_str!("../src/lib.rs");
+    let events = include_str!("../src/event.rs");
+    let store = include_str!("../src/reaction.rs");
+
+    for method in [
+        "insert_reaction_event_with_thread_metadata",
+        "add_reaction",
+        "remove_reaction",
+        "remove_reaction_by_source_event_id",
+        "get_active_reaction_record",
+        "set_reaction_event_id",
+        "get_reactions",
+        "get_reactions_bulk",
+    ] {
+        let signature = format!("pub async fn {method}(");
+        assert_eq!(count(root, &signature), 0, "{method} remains in lib.rs");
+        assert_eq!(count(events, &signature), 0, "{method} remains in event.rs");
+        assert_eq!(
+            count(store, &signature),
+            2,
+            "{method} must have one Db wrapper and one reaction SQL function"
+        );
+        assert_eq!(
+            count(store, &format!("name = \"{method}\"")),
+            1,
+            "{method} span is not unique"
+        );
+    }
+
+    assert_eq!(count(root, "enum ReactionEventInsertOutcome"), 0);
+    assert_eq!(count(events, "enum ReactionEventInsertOutcome"), 0);
+    assert_eq!(count(store, "enum ReactionEventInsertOutcome"), 1);
+    assert_eq!(count(events, "pub use crate::reaction::{"), 1);
+    assert_eq!(
+        count(events, "insert_reaction_event_with_thread_metadata"),
+        1
+    );
+    assert_eq!(count(events, "ReactionEventInsertOutcome"), 1);
+    assert_eq!(
+        count(
+            events,
+            "pub(crate) async fn insert_event_with_thread_metadata_tx("
+        ),
+        1,
+        "general event transaction primitive must remain event-owned"
+    );
+
+    for test_name in [
+        "reaction_single_tx_stores_wrapped_max_shortcode",
+        "reaction_single_tx_duplicate_short_circuit_stores_no_event",
+        "reaction_single_tx_cross_community_target_rejected",
+        "reaction_single_tx_event_insert_failure_rolls_back_reaction",
+        "reaction_single_tx_reactivates_soft_deleted_reaction",
+        "reactions_are_scoped_to_community",
+    ] {
+        assert_eq!(
+            count(root, &format!("async fn {test_name}(")),
+            0,
+            "{test_name} remains in lib.rs"
+        );
+        assert_eq!(
+            count(events, &format!("async fn {test_name}(")),
+            0,
+            "{test_name} remains in event.rs"
+        );
+        assert_eq!(
+            count(store, &format!("async fn {test_name}(")),
+            1,
+            "{test_name} is not singly reaction-owned"
+        );
+    }
+}
