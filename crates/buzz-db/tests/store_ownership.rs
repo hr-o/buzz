@@ -1008,9 +1008,6 @@ fn workflow_lifecycle_store_has_single_ownership() {
         assert_eq!(count(root, &format!("enum {ty}")), 0);
         assert_eq!(count(store, &format!("enum {ty}")), 1);
     }
-
-    assert_eq!(count(root, "pub async fn usage_workflow_counts("), 1);
-    assert_eq!(count(store, "pub async fn usage_workflow_counts("), 0);
 }
 
 #[test]
@@ -1064,4 +1061,56 @@ fn archived_identities_store_has_single_ownership() {
 
     assert_eq!(count(root, "struct ArchivedIdentity"), 0);
     assert_eq!(count(store, "struct ArchivedIdentity"), 1);
+}
+
+#[test]
+fn usage_store_has_single_ownership() {
+    let root = include_str!("../src/lib.rs");
+    let store = include_str!("../src/usage.rs");
+
+    for method in [
+        "usage_community_count",
+        "usage_user_counts",
+        "usage_channel_counts",
+        "usage_message_counts",
+        "usage_relay_member_counts",
+        "usage_workflow_counts",
+        "usage_git_repo_counts",
+        "usage_active_user_counts",
+        "usage_active_channel_counts",
+        "usage_community_hosts",
+    ] {
+        let signature = format!("pub async fn {method}(");
+        assert_eq!(count(root, &signature), 0, "{method} remains in lib.rs");
+        assert_eq!(
+            count(store, &signature),
+            1,
+            "{method} Db wrapper is not unique"
+        );
+        assert_eq!(
+            count(store, &format!("name = \"{method}\"")),
+            1,
+            "{method} span is not unique"
+        );
+    }
+
+    assert_eq!(count(root, "pub async fn try_lock_usage_metrics("), 0);
+    assert_eq!(count(store, "pub async fn try_lock_usage_metrics("), 1);
+    assert_eq!(count(store, "name = \"try_lock_usage_metrics\""), 1);
+    assert_eq!(count(root, "struct UsageMetricsLeader"), 0);
+    assert_eq!(count(store, "struct UsageMetricsLeader"), 1);
+    assert_eq!(
+        count(
+            root,
+            "test_usage_metrics_lock_has_single_owner_and_releases_on_drop"
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            store,
+            "test_usage_metrics_lock_has_single_owner_and_releases_on_drop"
+        ),
+        1
+    );
 }
