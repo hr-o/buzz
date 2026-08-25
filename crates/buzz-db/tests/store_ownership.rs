@@ -3,6 +3,70 @@ fn count(haystack: &str, needle: &str) -> usize {
 }
 
 #[test]
+fn relay_members_store_has_single_ownership() {
+    let root = include_str!("../src/lib.rs");
+    let store = include_str!("../src/relay_members.rs");
+
+    for method in [
+        "is_relay_member",
+        "get_relay_member",
+        "list_relay_members",
+        "add_relay_member",
+        "claim_relay_membership",
+        "has_join_policy_acceptance",
+        "remove_relay_member",
+        "remove_relay_member_if_role",
+        "update_relay_member_role",
+        "bootstrap_owner",
+        "has_admin_or_owner",
+        "transfer_ownership",
+        "backfill_from_allowlist",
+    ] {
+        let signature = format!("pub async fn {method}(");
+        assert_eq!(count(root, &signature), 0, "{method} remains in lib.rs");
+        assert_eq!(
+            count(store, &signature),
+            2,
+            "{method} must have one Db method and one SQL function in relay_members.rs"
+        );
+        let span = format!("name = \"{method}\"");
+        assert_eq!(count(store, &span), 1, "{method} span is not unique");
+    }
+
+    for method in [
+        "nip43_membership_snapshot_needs_reconciliation",
+        "publish_nip43_membership_locked",
+    ] {
+        let signature = format!("pub async fn {method}(");
+        assert_eq!(count(root, &signature), 0, "{method} remains in lib.rs");
+        assert_eq!(
+            count(store, &signature),
+            1,
+            "{method} must be singly owned by relay_members.rs"
+        );
+        let span = format!("name = \"{method}\"");
+        assert_eq!(count(store, &span), 1, "{method} span is not unique");
+    }
+
+    assert_eq!(
+        count(
+            root,
+            "async fn is_relay_member_is_bounded_routed_and_fails_closed("
+        ),
+        1,
+        "the cross-cutting route proof must remain in lib.rs"
+    );
+    assert_eq!(
+        count(
+            store,
+            "async fn is_relay_member_is_bounded_routed_and_fails_closed("
+        ),
+        0,
+        "the cross-cutting route proof must not move into the domain store"
+    );
+}
+
+#[test]
 fn channel_and_membership_stores_have_single_ownership() {
     let root = include_str!("../src/lib.rs");
     let channels = include_str!("../src/channel.rs");
