@@ -667,3 +667,82 @@ fn user_and_dm_stores_have_single_ownership() {
     assert_eq!(count(users, "async fn route_read("), 0);
     assert_eq!(count(dms, "async fn route_read("), 0);
 }
+
+#[test]
+fn push_store_has_single_ownership() {
+    let root = include_str!("../src/lib.rs");
+    let store = include_str!("../src/push.rs");
+
+    for method in [
+        "claim_due_push_match_batch",
+        "active_push_match_leases",
+        "complete_push_match_batch",
+        "retry_push_match_batch",
+        "reap_exhausted_push_matches",
+        "enqueue_push_wake",
+        "enqueue_push_wakes",
+        "claim_due_push_wakes",
+        "revalidate_push_wake",
+        "complete_push_wake",
+        "retry_push_wake",
+        "fail_push_wake",
+        "disable_push_endpoint",
+    ] {
+        let signature = format!("pub async fn {method}(");
+        assert_eq!(count(root, &signature), 0, "{method} remains in lib.rs");
+        assert_eq!(count(store, &signature), 1, "{method} is not singly owned");
+        assert_eq!(
+            count(store, &format!("name = \"{method}\"")),
+            1,
+            "{method} span is not unique"
+        );
+    }
+
+    assert_eq!(count(root, "pub async fn accept_push_lease_event("), 0);
+    assert_eq!(
+        count(store, "pub async fn accept_push_lease_event("),
+        1,
+        "accept_push_lease_event Db wrapper is not singly owned"
+    );
+    assert_eq!(count(store, "pub async fn accept_lease_event("), 1);
+    assert_eq!(
+        count(store, "name = \"accept_push_lease_event\""),
+        1,
+        "accept_push_lease_event span is not unique"
+    );
+
+    for ty in [
+        "LeaseVersion",
+        "ActiveLease",
+        "ReplaceLeaseOutcome",
+        "EnqueueWakeOutcome",
+        "NewWake",
+        "ClaimedWake",
+        "RevalidateWakeOutcome",
+        "MatchLease",
+        "AcceptLeaseOutcome",
+        "WakeRequest",
+        "ClaimedMatchBatch",
+        "BatchedMatch",
+    ] {
+        assert_eq!(count(root, &format!("struct {ty}")), 0);
+        assert_eq!(count(root, &format!("enum {ty}")), 0);
+        assert_eq!(
+            count(store, &format!("struct {ty}")) + count(store, &format!("enum {ty}")),
+            1,
+            "{ty} is not singly push-owned"
+        );
+    }
+
+    assert_eq!(
+        count(root, "pub async fn insert_event_with_serving_write_guard("),
+        1,
+        "deletion serving-write orchestration must remain cross-domain"
+    );
+    assert_eq!(
+        count(store, "pub async fn insert_event_with_serving_write_guard("),
+        0
+    );
+    assert_eq!(count(root, "async fn route_read("), 1);
+    assert_eq!(count(store, "async fn route_read("), 0);
+}
