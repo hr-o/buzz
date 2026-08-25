@@ -67,6 +67,33 @@ fn relay_members_store_has_single_ownership() {
 }
 
 #[test]
+fn relay_invite_store_has_single_ownership() {
+    let root = include_str!("../src/lib.rs");
+    let store = include_str!("../src/relay_invite.rs");
+
+    for method in [
+        "mint_relay_invite",
+        "reap_expired_relay_invites",
+        "claim_relay_invite",
+    ] {
+        let signature = format!("pub async fn {method}(");
+        assert_eq!(count(root, &signature), 0, "{method} remains in lib.rs");
+        assert_eq!(
+            count(store, &signature),
+            2,
+            "{method} must have one Db method and one SQL function in relay_invite.rs"
+        );
+        let span = format!("name = \"{method}\"");
+        assert_eq!(count(store, &span), 1, "{method} span is not unique");
+    }
+
+    for ty in ["pub enum ClaimOutcome", "pub struct MintedInvite"] {
+        assert_eq!(count(root, ty), 0, "{ty} remains in lib.rs");
+        assert_eq!(count(store, ty), 1, "{ty} is not singly owned");
+    }
+}
+
+#[test]
 fn channel_and_membership_stores_have_single_ownership() {
     let root = include_str!("../src/lib.rs");
     let channels = include_str!("../src/channel.rs");
