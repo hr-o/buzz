@@ -413,3 +413,58 @@ fn event_store_has_single_ownership() {
     assert_eq!(count(root, "pub async fn insert_mentions("), 1);
     assert_eq!(count(store, "pub async fn insert_mentions("), 0);
 }
+
+#[test]
+fn thread_store_has_single_ownership() {
+    let root = include_str!("../src/lib.rs");
+    let store = include_str!("../src/thread.rs");
+
+    for method in [
+        "insert_thread_metadata",
+        "get_thread_replies",
+        "get_thread_summary",
+        "get_channel_window",
+        "get_thread_metadata_by_event",
+        "decrement_reply_count",
+    ] {
+        let signature = format!("pub async fn {method}(");
+        assert_eq!(count(root, &signature), 0, "{method} remains in lib.rs");
+        assert_eq!(
+            count(store, &signature),
+            2,
+            "{method} must have one Db wrapper and one thread SQL function"
+        );
+    }
+
+    assert_eq!(
+        count(root, "pub async fn get_channel_window_with_session("),
+        0
+    );
+    assert_eq!(
+        count(store, "pub async fn get_channel_window_with_session("),
+        1
+    );
+
+    for span in [
+        "insert_thread_metadata",
+        "get_thread_replies",
+        "get_thread_summary",
+        "get_channel_window",
+        "get_thread_metadata_by_event",
+        "decrement_reply_count",
+    ] {
+        assert_eq!(
+            count(store, &format!("name = \"{span}\"")),
+            1,
+            "{span} span is not unique"
+        );
+    }
+    assert_eq!(
+        count(store, "name = \"get_channel_window_with_session\""),
+        0,
+        "the convenience and session APIs must share one logical span"
+    );
+
+    assert_eq!(count(root, "async fn route_read("), 1);
+    assert_eq!(count(store, "async fn route_read("), 0);
+}
