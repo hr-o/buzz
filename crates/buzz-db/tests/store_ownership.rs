@@ -94,6 +94,32 @@ fn relay_invite_store_has_single_ownership() {
 }
 
 #[test]
+fn product_feedback_store_has_single_ownership() {
+    let root = include_str!("../src/lib.rs");
+    let store = include_str!("../src/product_feedback.rs");
+
+    for method in ["insert_product_feedback", "list_product_feedback"] {
+        let signature = format!("pub async fn {method}(");
+        assert_eq!(count(root, &signature), 0, "{method} remains in lib.rs");
+        assert_eq!(
+            count(store, &signature),
+            1,
+            "{method} must be singly owned by product_feedback.rs"
+        );
+        let span = format!("name = \"{method}\"");
+        assert_eq!(count(store, &span), 1, "{method} span is not unique");
+    }
+
+    for ty in [
+        "pub struct NewProductFeedback",
+        "pub struct ProductFeedbackRecord",
+    ] {
+        assert_eq!(count(root, ty), 0, "{ty} remains in lib.rs");
+        assert_eq!(count(store, ty), 1, "{ty} is not singly owned");
+    }
+}
+
+#[test]
 fn channel_and_membership_stores_have_single_ownership() {
     let root = include_str!("../src/lib.rs");
     let channels = include_str!("../src/channel.rs");
