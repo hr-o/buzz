@@ -177,3 +177,69 @@ fn channel_and_membership_stores_have_single_ownership() {
         );
     }
 }
+
+#[test]
+fn api_token_store_has_single_ownership() {
+    let root = include_str!("../src/lib.rs");
+    let store = include_str!("../src/api_token.rs");
+
+    for method in [
+        "create_api_token",
+        "create_api_token_if_under_limit",
+        "get_api_token_by_hash_including_revoked",
+        "list_tokens_by_owner",
+        "revoke_token",
+        "revoke_all_tokens",
+    ] {
+        let signature = format!("pub async fn {method}(");
+        assert_eq!(count(root, &signature), 0, "{method} remains in lib.rs");
+        assert_eq!(
+            count(store, &signature),
+            2,
+            "{method} lacks Db or SQL ownership"
+        );
+        assert_eq!(
+            count(store, &format!("name = \"{method}\"")),
+            1,
+            "{method} span is not unique"
+        );
+    }
+
+    for method in [
+        "get_api_token_by_hash",
+        "touch_api_token",
+        "list_active_tokens",
+    ] {
+        let signature = format!("pub async fn {method}(");
+        assert_eq!(count(root, &signature), 0, "{method} remains in lib.rs");
+        assert_eq!(count(store, &signature), 1, "{method} is not singly owned");
+        assert_eq!(
+            count(store, &format!("name = \"{method}\"")),
+            1,
+            "{method} span is not unique"
+        );
+    }
+
+    assert_eq!(count(root, "pub async fn update_token_last_used("), 0);
+    assert_eq!(count(store, "pub async fn update_token_last_used("), 1);
+    assert_eq!(
+        count(store, "name = \"update_token_last_used\""),
+        0,
+        "alias must reuse the touch span"
+    );
+
+    for ty in ["ApiTokenRecord", "TokenSummary"] {
+        assert_eq!(
+            count(root, &format!("struct {ty}")),
+            0,
+            "{ty} remains in lib.rs"
+        );
+        assert_eq!(
+            count(store, &format!("struct {ty}")),
+            1,
+            "{ty} is not singly owned"
+        );
+    }
+    assert_eq!(count(root, "fn parse_api_token_row("), 0);
+    assert_eq!(count(store, "fn parse_api_token_row("), 1);
+}
