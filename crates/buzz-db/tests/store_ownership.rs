@@ -543,3 +543,46 @@ fn reaction_store_has_single_ownership() {
         );
     }
 }
+
+#[test]
+fn feed_store_has_single_ownership() {
+    let root = include_str!("../src/lib.rs");
+    let store = include_str!("../src/feed.rs");
+
+    for method in [
+        "query_feed_mentions",
+        "query_feed_mentions_routed",
+        "query_feed_needs_action",
+        "query_feed_needs_action_routed",
+        "query_feed_activity",
+        "query_feed_activity_routed",
+    ] {
+        let signature = format!("pub async fn {method}(");
+        assert_eq!(count(root, &signature), 0, "{method} remains in lib.rs");
+        assert_eq!(count(store, &signature), 1, "{method} is not singly owned");
+        assert_eq!(
+            count(store, &format!("name = \"{method}\"")),
+            1,
+            "{method} span is not unique"
+        );
+    }
+
+    for sql_fn in ["query_mentions", "query_needs_action", "query_activity"] {
+        assert_eq!(
+            count(store, &format!("pub async fn {sql_fn}(")),
+            1,
+            "{sql_fn} SQL entry point is not singly feed-owned"
+        );
+    }
+
+    assert_eq!(count(root, "async fn route_read("), 1);
+    assert_eq!(count(store, "async fn route_read("), 0);
+    assert_eq!(
+        count(
+            root,
+            "async fn routed_reads_are_confined_to_the_requested_community("
+        ),
+        1,
+        "cross-domain routing confinement must remain runtime-owned"
+    );
+}
