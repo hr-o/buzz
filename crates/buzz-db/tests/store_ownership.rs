@@ -1012,3 +1012,32 @@ fn workflow_lifecycle_store_has_single_ownership() {
     assert_eq!(count(root, "pub async fn usage_workflow_counts("), 1);
     assert_eq!(count(store, "pub async fn usage_workflow_counts("), 0);
 }
+
+#[test]
+fn git_repo_store_has_single_ownership() {
+    let root = include_str!("../src/lib.rs");
+    let store = include_str!("../src/git_repo.rs");
+
+    for method in [
+        "repo_name_owner",
+        "reserve_repo_name",
+        "count_repos_for_owner",
+        "release_repo_name",
+    ] {
+        let signature = format!("pub async fn {method}(");
+        assert_eq!(count(root, &signature), 0, "{method} remains in lib.rs");
+        assert_eq!(
+            count(store, &signature),
+            2,
+            "{method} must have one Db wrapper and one git registry SQL function"
+        );
+        assert_eq!(
+            count(store, &format!("name = \"{method}\"")),
+            1,
+            "{method} span is not unique"
+        );
+    }
+
+    assert_eq!(count(root, "enum ReserveOutcome"), 0);
+    assert_eq!(count(store, "enum ReserveOutcome"), 1);
+}
