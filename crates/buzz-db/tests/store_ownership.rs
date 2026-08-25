@@ -335,3 +335,81 @@ fn reminder_store_has_single_ownership() {
     );
     assert_eq!(count(store, "pub fn extract_not_before("), 0);
 }
+
+#[test]
+fn event_store_has_single_ownership() {
+    let root = include_str!("../src/lib.rs");
+    let store = include_str!("../src/event.rs");
+
+    for method in [
+        "insert_event",
+        "query_events",
+        "count_events",
+        "huddle_started_link_exists",
+        "get_latest_global_replaceable",
+        "get_event_by_id",
+        "get_event_by_id_including_deleted",
+        "soft_delete_event",
+        "soft_delete_by_coordinate",
+        "soft_delete_event_and_update_thread",
+        "get_last_message_at",
+        "get_last_message_at_bulk",
+        "get_events_by_ids",
+        "insert_event_with_thread_metadata",
+    ] {
+        let signature = format!("pub async fn {method}(");
+        let expected_root = if method == "query_events" { 1 } else { 0 };
+        assert_eq!(
+            count(root, &signature),
+            expected_root,
+            "{method} Db wrapper remains in lib.rs"
+        );
+        assert_eq!(
+            count(store, &signature),
+            2,
+            "{method} must have one Db wrapper and one event SQL function"
+        );
+        assert_eq!(
+            count(store, &format!("name = \"{method}\"")),
+            1,
+            "{method} span is not unique"
+        );
+    }
+
+    for method in [
+        "query_events_routed",
+        "query_events_routed_bounded",
+        "count_events_routed",
+        "get_events_by_ids_routed",
+        "soft_delete_discovery_events",
+    ] {
+        let signature = format!("pub async fn {method}(");
+        assert_eq!(count(root, &signature), 0, "{method} remains in lib.rs");
+        assert_eq!(count(store, &signature), 1, "{method} is not singly owned");
+        assert_eq!(
+            count(store, &format!("name = \"{method}\"")),
+            1,
+            "{method} span is not unique"
+        );
+    }
+
+    assert_eq!(
+        count(
+            root,
+            "async fn coordinate_delete_spares_head_newer_than_the_deletion("
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            store,
+            "async fn coordinate_delete_spares_head_newer_than_the_deletion("
+        ),
+        1
+    );
+
+    assert_eq!(count(root, "async fn route_read("), 1);
+    assert_eq!(count(store, "async fn route_read("), 0);
+    assert_eq!(count(root, "pub async fn insert_mentions("), 1);
+    assert_eq!(count(store, "pub async fn insert_mentions("), 0);
+}
