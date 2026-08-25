@@ -1183,3 +1183,36 @@ fn maintenance_store_facades_have_single_ownership() {
     );
     assert_eq!(count(event, "name = \"backfill_d_tags\""), 1);
 }
+
+#[test]
+fn deletion_store_facades_have_single_ownership() {
+    let root = include_str!("../src/lib.rs");
+    let store = include_str!("../src/deletion.rs");
+
+    for method in [
+        "validate_deletion_serving_catalog",
+        "validate_deletion_catalog",
+    ] {
+        let signature = format!("pub async fn {method}(");
+        assert_eq!(count(root, &signature), 0, "{method} remains in lib.rs");
+        assert_eq!(
+            count(store, &signature),
+            1,
+            "{method} deletion facade is not unique"
+        );
+    }
+
+    assert_eq!(count(root, "pub fn deletion_store("), 0);
+    assert_eq!(count(store, "pub fn deletion_store("), 1);
+    assert_eq!(count(store, "pub struct DeletionStore"), 1);
+
+    assert_eq!(
+        count(root, "pub async fn insert_event_with_serving_write_guard("),
+        1,
+        "the cross-domain serving-write/event transaction must remain runtime-owned"
+    );
+    assert_eq!(
+        count(store, "pub async fn insert_event_with_serving_write_guard("),
+        0
+    );
+}
