@@ -516,7 +516,7 @@ fn row_to_channel_record(row: sqlx::postgres::PgRow) -> Result<ChannelRecord> {
     })
 }
 
-// -- Tests --------------------------------------------------------------------
+// -- Db API -------------------------------------------------------------------
 
 impl Db {
     /// Find an existing DM by its participant hash.
@@ -598,6 +598,8 @@ impl Db {
         crate::dm::list_hidden_dms(&self.pool, community_id, pubkey).await
     }
 }
+
+// -- Tests --------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
