@@ -378,19 +378,47 @@ test("finding 3 easy branch: a fresh click beats an evicted high-rev entry at an
 // here as the hard branch (not disguised as safety).
 test("finding 3 hard branch: equal-second evicted click (rev 1) loses to observed remote (rev 100)", () => {
   const NOW = 777;
-  // Remount click on the evicted channel: empty high-water → rev 1, updatedAt=NOW.
-  const click = S(E(true, NOW, 1));
-  // The previously observed remote for the same channel at the same second,
-  // rev 100 (it may precede the remount — not genuinely concurrent).
-  const remote = S(E(false, NOW, 100));
-  const merged = mergeStores(click, remote);
+  const TARGET = "aaa-target"; // lexicographically small → evicted by the id tiebreak
+
+  // >500 entries all at the CURRENT second (NOW). With MAX+1 equal-updatedAt
+  // entries, boundStarStore sorts ascending by (updatedAt, id) and keeps the
+  // highest MAX, so the lowest id is evicted — TARGET, NOT because it is old.
+  const channels = { [TARGET]: E(true, NOW, 7) };
+  for (let i = 0; i < MAX_CHANNEL_STAR_ENTRIES; i++) {
+    channels[`z-${String(i).padStart(3, "0")}`] = E(true, NOW, 0);
+  }
+  const bounded = boundStarStore({ version: 1, channels });
+  assert.equal(
+    Object.keys(bounded.channels).length,
+    MAX_CHANNEL_STAR_ENTRIES,
+    "bound trims to the cap",
+  );
+  assert.equal(
+    bounded.channels[TARGET],
+    undefined,
+    "TARGET evicted by the id tiebreak at equal updatedAt",
+  );
+
+  // Remount in the same second: TARGET's rev high-water is gone with the entry,
+  // so a fresh click mints rev 1 at updatedAt=NOW.
+  const click = { version: 1, channels: { [TARGET]: E(true, NOW, 1) } };
+  // The previously observed remote for TARGET at the same second, rev 100 (it
+  // may precede the remount — not genuinely concurrent).
+  const remote = { version: 1, channels: { [TARGET]: E(false, NOW, 100) } };
+
+  // equal updatedAt → rev decides → 100 > 1: the click LOSES. Documented
+  // deterministic residual, proven here through real eviction+remount, not a
+  // pre-shrunk tuple. Deterministic in both merge orders — a lost click, never
+  // a divergence.
   assert.deepEqual(
-    merged.channels.c,
+    mergeStores(click, remote).channels[TARGET],
     E(false, NOW, 100),
     "equal updatedAt → higher rev wins deterministically (documented residual)",
   );
-  // Deterministic either merge order — a lost click, never a divergence.
-  assert.deepEqual(mergeStores(remote, click).channels.c, E(false, NOW, 100));
+  assert.deepEqual(
+    mergeStores(remote, click).channels[TARGET],
+    E(false, NOW, 100),
+  );
 });
 
 // ── starredChannelIdsFromStore ────────────────────────────────────────────────

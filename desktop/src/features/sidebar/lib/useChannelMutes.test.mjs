@@ -327,6 +327,69 @@ test("empty-store click survives a later higher-rev head with an older updatedAt
   }
 });
 
+// Unobserved-future residual (accepted mixed-fleet case, MINOR-2 contrast to the
+// fast-clock fix): a click mints at wall-clock t with an empty high-water; a
+// genuinely UNOBSERVED opposite-value head then arrives at t+300 and wins on the
+// primary updatedAt key. The logical-monotonic stamp only defends against state
+// the replica already observed — a future head it never saw before clicking is
+// not covered, exactly as under today's shipped LWW.
+test("unobserved future head wins over an empty-high-water click on primary updatedAt", async () => {
+  const { act, cleanup, renderHook } = await import("@testing-library/react");
+  const { relayClient } = await import("@/shared/api/relayClient");
+  const { useChannelMutes } = await import("./useChannelMutes.ts");
+
+  const live = {};
+  const restore = stubRelay(relayClient, { live });
+  const origTauri = window.__TAURI_INTERNALS__;
+  const origDateNow = Date.now;
+  Date.now = () => 1000 * 1_000; // click at updatedAt 1000 (t)
+  window.__TAURI_INTERNALS__ = {
+    invoke: (cmd) => {
+      // fetchEvents is stubbed empty, so bootstrap/pre-publish never decrypt;
+      // the only decrypt is the live head — the genuinely unobserved future
+      // entry at updatedAt 1300, delivered after the empty-high-water click.
+      if (cmd === "nip44_decrypt_from_self")
+        return Promise.resolve(
+          mutePayload({ shared: { muted: false, updatedAt: 1300, rev: 1 } }),
+        );
+      return Promise.reject(new Error(`unmocked ${cmd}`));
+    },
+  };
+  const pubkey = "pk-unobserved-future";
+  let hook = null;
+  try {
+    await act(async () => {
+      hook = renderHook(() => useChannelMutes(pubkey, "wss://r"));
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    });
+    await act(async () => hook.result.current.muteChannel("shared")); // empty store → rev 1 @ 1000
+    await act(async () => {
+      // Genuinely unobserved head at t+300 (updatedAt 1300), opposite value.
+      live.cb({
+        id: "unobserved-future",
+        pubkey,
+        created_at: 1300,
+        content: "cipher",
+        kind: 30078,
+        tags: [["d", "channel-mutes"]],
+        sig: "s",
+      });
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    });
+    assert.equal(
+      hook.result.current.mutedChannelIds.has("shared"),
+      false,
+      "unobserved future head wins on primary updatedAt (accepted residual)",
+    );
+    hook.unmount();
+  } finally {
+    cleanup();
+    Date.now = origDateNow;
+    window.__TAURI_INTERNALS__ = origTauri;
+    restore();
+  }
+});
+
 // Cross-window storage: a peer window's write is observed into the high-water
 // and max-merged, so a following click sees the peer's rev and no edit is lost.
 test("cross-window storage event is observed and max-merged", async () => {
