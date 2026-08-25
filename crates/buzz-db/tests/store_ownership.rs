@@ -962,8 +962,9 @@ fn workflow_lifecycle_store_has_single_ownership() {
     );
 
     for ty in ["WorkflowRecord", "ScheduledWorkflowFireClaim"] {
-        assert_eq!(count(root, &format!("struct {ty}")), 0);
-        assert_eq!(count(store, &format!("struct {ty}")), 1);
+        let declaration = format!("pub struct {ty} {{");
+        assert_eq!(count(root, &declaration), 0);
+        assert_eq!(count(store, &declaration), 1);
     }
     assert_eq!(count(root, "enum WorkflowStatus"), 0);
     assert_eq!(count(store, "enum WorkflowStatus"), 1);
@@ -1113,4 +1114,41 @@ fn usage_store_has_single_ownership() {
         ),
         1
     );
+}
+
+#[test]
+fn admin_moderation_store_has_single_ownership() {
+    let root = include_str!("../src/lib.rs");
+    let store = include_str!("../src/admin_moderation.rs");
+
+    for method in [
+        "admin_list_reports",
+        "admin_get_report",
+        "admin_list_feedback",
+        "admin_get_feedback",
+    ] {
+        let signature = format!("pub async fn {method}(");
+        assert_eq!(count(root, &signature), 0, "{method} remains in lib.rs");
+        assert_eq!(
+            count(store, &signature),
+            1,
+            "{method} Db wrapper is not unique"
+        );
+        assert_eq!(
+            count(store, &format!("name = \"{method}\"")),
+            1,
+            "{method} span is not unique"
+        );
+    }
+
+    for ty in [
+        "AdminReport",
+        "AdminReportedMessage",
+        "AdminReportDetail",
+        "AdminFeedback",
+    ] {
+        let declaration = format!("pub struct {ty} {{");
+        assert_eq!(count(root, &declaration), 0);
+        assert_eq!(count(store, &declaration), 1);
+    }
 }
