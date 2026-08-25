@@ -120,6 +120,52 @@ fn product_feedback_store_has_single_ownership() {
 }
 
 #[test]
+fn moderation_store_has_single_ownership() {
+    let root = include_str!("../src/lib.rs");
+    let store = include_str!("../src/moderation.rs");
+
+    for method in [
+        "insert_moderation_report",
+        "list_moderation_reports",
+        "get_moderation_report",
+        "get_moderation_report_by_event",
+        "resolve_moderation_report",
+        "ban_community_member",
+        "unban_community_member",
+        "timeout_community_member",
+        "untimeout_community_member",
+        "moderation_restriction_state",
+        "get_community_ban",
+        "list_community_restrictions",
+        "insert_moderation_action",
+        "list_moderation_actions",
+    ] {
+        let signature = format!("pub async fn {method}(");
+        assert_eq!(count(root, &signature), 0, "{method} remains in lib.rs");
+        assert_eq!(
+            count(store, &signature),
+            1,
+            "{method} must be singly owned by moderation.rs"
+        );
+        let span = format!("name = \"{method}\"");
+        assert_eq!(count(store, &span), 1, "{method} span is not unique");
+    }
+
+    for ty in [
+        "pub enum ReportTarget",
+        "pub struct NewReport",
+        "pub struct ReportRecord",
+        "pub struct BanRecord",
+        "pub struct RestrictionState",
+        "pub struct NewAction",
+        "pub struct ActionRecord",
+    ] {
+        assert_eq!(count(root, ty), 0, "{ty} remains in lib.rs");
+        assert_eq!(count(store, ty), 1, "{ty} is not singly owned");
+    }
+}
+
+#[test]
 fn channel_and_membership_stores_have_single_ownership() {
     let root = include_str!("../src/lib.rs");
     let channels = include_str!("../src/channel.rs");
