@@ -1152,3 +1152,34 @@ fn admin_moderation_store_has_single_ownership() {
         assert_eq!(count(store, &declaration), 1);
     }
 }
+
+#[test]
+fn maintenance_store_facades_have_single_ownership() {
+    let root = include_str!("../src/lib.rs");
+    let partition = include_str!("../src/partition.rs");
+    let event = include_str!("../src/event.rs");
+
+    assert_eq!(
+        count(root, "pub async fn ensure_future_partitions("),
+        0,
+        "partition facade remains in lib.rs"
+    );
+    assert_eq!(
+        count(partition, "pub async fn ensure_future_partitions("),
+        2,
+        "partition module must own one Db facade and one pool operation"
+    );
+    assert_eq!(count(partition, "name = \"ensure_future_partitions\""), 1);
+
+    assert_eq!(
+        count(root, "pub async fn backfill_d_tags("),
+        0,
+        "event backfill remains in lib.rs"
+    );
+    assert_eq!(
+        count(event, "pub async fn backfill_d_tags("),
+        1,
+        "event module must own the backfill facade"
+    );
+    assert_eq!(count(event, "name = \"backfill_d_tags\""), 1);
+}
